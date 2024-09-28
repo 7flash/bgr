@@ -25,19 +25,13 @@ async function checkForRemoteUpdate(): Promise<boolean> {
   return localHash.trim() !== remoteHash.trim();
 }
 
-async function runCommandAndLogOutput(command: string) {
+async function runCommandAndLogOutput(command: string): Promise<{ stdout: string; logFileName: string; }> {
   const logFileName = `log_${getFormattedTime()}.txt`;
-  const latestLogFilePath = join(logDirectory, "latest-logs.txt");
-  const newLogFilePath = join(logDirectory, logFileName);
-
   const stdout = await $`echo ${{ raw: command }}`.text();
-  await Bun.write(newLogFilePath, new Blob([stdout]));
-  await Bun.write(latestLogFilePath, new Blob([stdout]));
-
-  return { newLogFilePath, latestLogFilePath };
+  return { stdout, logFileName };
 }
 
-async function commitAndPushLogs(newLogFilePath: string) {
+async function commitAndPushLogs(stdout: string, logFileName: string) {
   const branchName = "test-logs";
   const currentBranch = (await $`git rev-parse --abbrev-ref HEAD`.text()).trim();
 
@@ -49,7 +43,13 @@ async function commitAndPushLogs(newLogFilePath: string) {
     await $`git checkout ${branchName}`;
   }
 
-  await $`git add ${newLogFilePath} ${logDirectory}/latest-logs.txt`;
+  const newLogFilePath = join(logDirectory, logFileName);
+  const latestLogFilePath = join(logDirectory, "latest-logs.txt");
+
+  await Bun.write(newLogFilePath, new Blob([stdout]));
+  await Bun.write(latestLogFilePath, new Blob([stdout]));
+
+  await $`git add ${newLogFilePath} ${latestLogFilePath}`;
   await $`git commit -m "Update logs - ${getFormattedTime()}"`;
   await $`git push -u origin ${branchName}`;
 
@@ -68,9 +68,9 @@ async function autoRefresh() {
         await $`git pull`;
         await $`npm version patch`;
 
-        const { newLogFilePath, latestLogFilePath } = await runCommandAndLogOutput(command);
+        const { stdout, logFileName } = await runCommandAndLogOutput(command);
 
-        await commitAndPushLogs(newLogFilePath);
+        await commitAndPushLogs(stdout, logFileName);
       }
     } catch (err) {
       console.error("Error during auto-refresh cycle:", err);
