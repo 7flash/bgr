@@ -30,7 +30,7 @@ async function runCommandAndLogOutput(command: string) {
   const latestLogFilePath = join(logDirectory, "latest-logs.txt");
   const newLogFilePath = join(logDirectory, logFileName);
 
-  const stdout = await $`${command}`.text();
+  const stdout = await $`echo ${{ raw: command }}`.text();
   await Bun.write(newLogFilePath, new Blob([stdout]));
   await Bun.write(latestLogFilePath, new Blob([stdout]));
 
