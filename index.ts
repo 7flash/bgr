@@ -1,10 +1,13 @@
 import { $ } from "bun";
 import { join } from "path";
+import { watch } from "fs/promises";
 
-const logDirectory = join(process.env.HOME || '~', 'logs');
+// Get the current working directory of where the script is executed
+const repoDirectory = await $`git rev-parse --show-toplevel`.text().trim();
+const logDirectory = join(repoDirectory, 'logs');
 const command = process.env.REFRESH_CMD || "echo 777";
 
-function getFormattedTime() {
+function getFormattedTime(): string {
   const now = new Date();
   const pad = (num: number) => num.toString().padStart(2, '0');
   const year = now.getFullYear();
@@ -16,7 +19,7 @@ function getFormattedTime() {
   return `${year}-${month}-${day}_${hours}-${minutes}-${seconds}`;
 }
 
-async function checkForRemoteUpdate() {
+async function checkForRemoteUpdate(): Promise<boolean> {
   const localHash = await $`git rev-parse @`.text();
   const remoteHash = await $`git rev-parse @{u}`.text();
   return localHash.trim() !== remoteHash.trim();
@@ -27,7 +30,7 @@ async function runCommandAndLogOutput(command: string) {
   const latestLogFilePath = join(logDirectory, "latest-logs.txt");
   const newLogFilePath = join(logDirectory, logFileName);
 
-  const stdout = await $`echo 123`.text();
+  const stdout = await $`${command}`.text();
   await Bun.write(newLogFilePath, new Blob([stdout]));
   await Bun.write(latestLogFilePath, new Blob([stdout]));
 
@@ -65,7 +68,7 @@ async function autoRefresh() {
         await $`git pull`;
         await $`npm version patch`;
 
-        const { newLogFilePath } = await runCommandAndLogOutput(command);
+        const { newLogFilePath, latestLogFilePath } = await runCommandAndLogOutput(command);
 
         await commitAndPushLogs(newLogFilePath);
       }
@@ -80,4 +83,3 @@ async function autoRefresh() {
 if (import.meta.path === Bun.main) {
   autoRefresh();
 }
-
