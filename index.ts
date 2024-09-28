@@ -3,7 +3,7 @@ import { join } from "path";
 import { watch } from "fs/promises";
 
 // Get the current working directory of where the script is executed
-const repoDirectory = await $`git rev-parse --show-toplevel`.text().trim();
+const repoDirectory = (await $`git rev-parse --show-toplevel`.text()).trim();
 const logDirectory = join(repoDirectory, 'logs');
 const command = process.env.REFRESH_CMD || "echo 777";
 
