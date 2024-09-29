@@ -10,6 +10,20 @@ const logDirectory = join(repoDirectory, 'logs');
 const packageJsonPath = join(repoDirectory, 'package.json');
 const packageJsonBlob = Bun.file(packageJsonPath);
 const packageJson = JSON.parse(await packageJsonBlob.text());
+
+if (!packageJson.refresh_cmd) {
+  console.error("Error: 'refresh_cmd' is missing in package.json.");
+  console.error("Please add 'refresh_cmd' to your package.json. Example:");
+  console.error(`
+{
+  "name": "your-project",
+  "version": "1.0.0",
+  "refresh_cmd": "your-command-here"
+}
+  `);
+  process.exit(1);
+}
+
 const command = packageJson.refresh_cmd;
 
 function getFormattedTime(): string {
