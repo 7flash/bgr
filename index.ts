@@ -1,15 +1,16 @@
 import { $ } from "bun";
 import { join } from "path";
 import { watch } from "fs/promises";
-import { readFileSync } from "fs";
+import { promises as fs } from "fs";
 
 // Get the current working directory of where the script is executed
 const repoDirectory = (await $`git rev-parse --show-toplevel`.text()).trim();
 const logDirectory = join(repoDirectory, 'logs');
 
-// Retrieve the command from package.json
-const packageJson = JSON.parse(readFileSync(join(repoDirectory, 'package.json'), 'utf-8'));
-const command = packageJson.scripts?.refresh_cmd || "echo 777";
+// Read package.json to get the refresh command
+const packageJsonPath = join(repoDirectory, 'package.json');
+const packageJson = JSON.parse(await fs.readFile(packageJsonPath, 'utf-8'));
+const command = packageJson.refresh_cmd || "echo 777";
 
 function getFormattedTime(): string {
   const now = new Date();
@@ -23,33 +24,36 @@ function getFormattedTime(): string {
   return `${year}-${month}-${day}_${hours}-${minutes}-${seconds}`;
 }
 
+async function writeLogFiles(stdout: string) {
+  const logFileName = `log_${getFormattedTime()}.txt`;
+  const latestLogFilePath = join(logDirectory, "latest-logs.txt");
+  const newLogFilePath = join(logDirectory, logFileName);
+
+  await Bun.write(newLogFilePath, new Blob([stdout]));
+  await Bun.write(latestLogFilePath, new Blob([stdout]));
+
+  return { newLogFilePath, latestLogFilePath };
+}
+
 async function reloadThenExecuteAndCommitLogs() {
   let firstRun = true;
-
+  
   while (true) {
     try {
       await $`git fetch`;
 
-      const localHash = await $`git rev-parse @`.text();
-      const remoteHash = await $`git rev-parse @{u}`.text();
-      const hasRemoteUpdate = localHash.trim() !== remoteHash.trim();
-
-      if (hasRemoteUpdate || firstRun) {
+      const localHash = (await $`git rev-parse @`.text()).trim();
+      const remoteHash = (await $`git rev-parse @{u}`.text()).trim();
+      
+      if (localHash !== remoteHash || firstRun) {
         firstRun = false;
         await $`git pull`;
 
-        // Run the specified command
+        // Execute the command directly
         const stdout = await $`${command}`.text();
 
-        // Write logs to files
-        const logFileName = `log_${getFormattedTime()}.txt`;
-        const latestLogFilePath = join(logDirectory, "latest-logs.txt");
-        const newLogFilePath = join(logDirectory, logFileName);
+        const { newLogFilePath, latestLogFilePath } = await writeLogFiles(stdout);
 
-        await Bun.write(newLogFilePath, new Blob([stdout]));
-        await Bun.write(latestLogFilePath, new Blob([stdout]));
-
-        // Commit and push logs
         const branchName = "test-logs";
         const currentBranch = (await $`git rev-parse --abbrev-ref HEAD`.text()).trim();
 
@@ -67,31 +71,13 @@ async function reloadThenExecuteAndCommitLogs() {
         await $`git checkout ${currentBranch}`;
       }
     } catch (err) {
-      console.error("Error during auto-refresh cycle:", err);
+      console.error("Error during reload and execute cycle:", err);
     }
 
-    await Bun.sleep(5 * 1000); // Sleep for 5 seconds before the next cycle
+    await Bun.sleep(5 * 1000);
   }
 }
 
 if (import.meta.path === Bun.main) {
   reloadThenExecuteAndCommitLogs();
 }
-```
-
-This script now:
-
-1. Retrieves the `refresh_cmd` script from `package.json`.
-2. Executes the command directly.
-3. Combines the functionality into a single `reloadThenExecuteAndCommitLogs` function.
-4. Simplifies the logic while keeping the necessary error handling and logging.
-
-Make sure your `package.json` includes a `refresh_cmd` script, like so:
-
-```json
-{
-  "scripts": {
-    "refresh_cmd": "your-command-here"
-  }
-}
-```
