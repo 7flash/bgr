@@ -47,7 +47,10 @@ async function reloadThenExecuteAndCommitLogs() {
 
         const branchName = "test-logs";
         const currentBranch = (await $`git rev-parse --abbrev-ref HEAD`.text()).trim();
-        const commitMessage = "Update logs";
+        
+        // Get the last commit message and trim to its first line
+        const lastCommitMessage = (await $`git log -1 --pretty=%B`.text()).trim().split('\n')[0];
+        const commitMessage = `Update logs - ${lastCommitMessage}`;
 
         try {
           await $`git checkout -b ${branchName}`;
