@@ -1,7 +1,6 @@
 import { $ } from "bun";
 import { join } from "path";
 import { watch } from "fs/promises";
-import { readFile } from "fs/promises";
 
 // Get the current working directory of where the script is executed
 const repoDirectory = (await $`git rev-parse --show-toplevel`.text()).trim();
@@ -27,14 +26,14 @@ function getFormattedTime(): string {
 
 async function reloadThenExecuteAndCommitLogs() {
   let firstRun = true;
-  
+
   while (true) {
     try {
       await $`git fetch`;
 
       const localHash = (await $`git rev-parse @`.text()).trim();
       const remoteHash = (await $`git rev-parse @{u}`.text()).trim();
-      
+
       if (localHash !== remoteHash || firstRun) {
         firstRun = false;
         await $`git pull`;
