@@ -1,7 +1,7 @@
 import { $ } from "bun";
 import { join } from "path";
 import { watch } from "fs/promises";
-import { promises as fs } from "fs";
+import { readFile } from "fs/promises";
 
 // Get the current working directory of where the script is executed
 const repoDirectory = (await $`git rev-parse --show-toplevel`.text()).trim();
@@ -9,8 +9,9 @@ const logDirectory = join(repoDirectory, 'logs');
 
 // Read package.json to get the refresh command
 const packageJsonPath = join(repoDirectory, 'package.json');
-const packageJson = JSON.parse(await fs.readFile(packageJsonPath, 'utf-8'));
-const command = packageJson.refresh_cmd || "echo 777";
+const packageJsonBlob = Bun.file(packageJsonPath);
+const packageJson = JSON.parse(await packageJsonBlob.text());
+const command = packageJson.refresh_cmd;
 
 function getFormattedTime(): string {
   const now = new Date();
@@ -22,17 +23,6 @@ function getFormattedTime(): string {
   const minutes = pad(now.getMinutes());
   const seconds = pad(now.getSeconds());
   return `${year}-${month}-${day}_${hours}-${minutes}-${seconds}`;
-}
-
-async function writeLogFiles(stdout: string) {
-  const logFileName = `log_${getFormattedTime()}.txt`;
-  const latestLogFilePath = join(logDirectory, "latest-logs.txt");
-  const newLogFilePath = join(logDirectory, logFileName);
-
-  await Bun.write(newLogFilePath, new Blob([stdout]));
-  await Bun.write(latestLogFilePath, new Blob([stdout]));
-
-  return { newLogFilePath, latestLogFilePath };
 }
 
 async function reloadThenExecuteAndCommitLogs() {
@@ -52,10 +42,13 @@ async function reloadThenExecuteAndCommitLogs() {
         // Execute the command directly
         const stdout = await $`${command}`.text();
 
-        const { newLogFilePath, latestLogFilePath } = await writeLogFiles(stdout);
+        const logFileName = `log_${getFormattedTime()}.txt`;
+        const latestLogFilePath = join(logDirectory, "latest-logs.txt");
+        const newLogFilePath = join(logDirectory, logFileName);
 
         const branchName = "test-logs";
         const currentBranch = (await $`git rev-parse --abbrev-ref HEAD`.text()).trim();
+        const commitMessage = "Update logs";
 
         try {
           await $`git checkout -b ${branchName}`;
@@ -64,8 +57,11 @@ async function reloadThenExecuteAndCommitLogs() {
           await $`git checkout ${branchName}`;
         }
 
+        await Bun.write(newLogFilePath, new Blob([stdout]));
+        await Bun.write(latestLogFilePath, new Blob([stdout]));
+
         await $`git add ${newLogFilePath} ${latestLogFilePath}`;
-        await $`git commit -m "Update logs - ${getFormattedTime()}"`;
+        await $`git commit -m "${commitMessage} - ${getFormattedTime()}"`;
         await $`git push -u origin ${branchName}`;
 
         await $`git checkout ${currentBranch}`;
