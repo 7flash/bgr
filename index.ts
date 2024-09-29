@@ -9,7 +9,23 @@ const logDirectory = join(repoDirectory, 'logs');
 // Read package.json to get the refresh command
 const packageJsonPath = join(repoDirectory, 'package.json');
 const packageJsonBlob = Bun.file(packageJsonPath);
-const packageJson = JSON.parse(await packageJsonBlob.text());
+
+let packageJson: any;
+
+try {
+  packageJson = JSON.parse(await packageJsonBlob.text());
+} catch (err) {
+  console.error("Error: Unable to parse package.json.");
+  console.error("Please ensure your package.json is valid JSON. Example:");
+  console.error(`
+{
+  "name": "your-project",
+  "version": "1.0.0",
+  "refresh_cmd": "your-command-here"
+}
+  `);
+  process.exit(1);
+}
 
 if (!packageJson.refresh_cmd) {
   console.error("Error: 'refresh_cmd' is missing in package.json.");
