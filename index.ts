@@ -77,7 +77,7 @@ async function reloadThenExecuteAndCommitLogs() {
         await $`git pull`;
 
         console.log(`Executing command: ${command}`);
-        const stdout = await $`${command}`.text();
+        const stdout = await $`${command} 2>&1`.text();
         console.log(`Command output: ${stdout}`);
 
         const logFileName = `log_${getFormattedTime()}.txt`;
