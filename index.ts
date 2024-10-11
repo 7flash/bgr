@@ -1,10 +1,15 @@
-import { $ } from "bun";
+import { $, sleep, write, file } from "bun";
 import { join } from "path";
 import { watch } from "fs/promises";
 
+
 // Get the current working directory of where the script is executed
 const repoDirectory = (await $`git rev-parse --show-toplevel`.text()).trim();
-const logDirectory = join(repoDirectory, 'logs');
+const logDirectory = join(repoDirectory, 'bgr-output');
+
+// Get the remote name from environment variable or use default
+const remoteName = process.env.GIT_REMOTE_NAME || "7flash";
+console.log(`Using git remote: ${remoteName}`);
 
 // Read package.json to get the refresh command
 const packageJsonPath = join(repoDirectory, 'package.json');
@@ -63,10 +68,10 @@ async function reloadThenExecuteAndCommitLogs() {
   while (true) {
     try {
       console.log("Fetching latest changes...");
-      await $`git fetch`;
+      await $`git fetch ${remoteName}`;
 
       const localHash = (await $`git rev-parse @`.text()).trim();
-      const remoteHash = (await $`git rev-parse @{u}`.text()).trim();
+      const remoteHash = (await $`git rev-parse ${remoteName}/$(git rev-parse --abbrev-ref HEAD)`.text()).trim();
 
       console.log(`Local hash: ${localHash}`);
       console.log(`Remote hash: ${remoteHash}`);
@@ -74,24 +79,24 @@ async function reloadThenExecuteAndCommitLogs() {
       if (localHash !== remoteHash || firstRun) {
         firstRun = false;
         console.log("Pulling latest changes...");
-        await $`git pull`;
+        await $`git pull ${remoteName} $(git rev-parse --abbrev-ref HEAD)`;
 
         console.log(`Executing command: ${command}`);
-        let stdout = await $`${{ raw: command }} 2>&1`.text();
+        let stdout = await $`${{ raw: command }} 2>&1`.nothrow().text();
         console.log(`Command output: ${stdout}`);
 
         const logFileName = `log_${getFormattedTime()}.txt`;
-        const latestLogFilePath = join(logDirectory, "latest-logs.txt");
+        const latestLogFilePath = join(logDirectory, "latest.txt");
         const newLogFilePath = join(logDirectory, logFileName);
 
-        const branchName = "test-logs";
+        const branchName = "bgr";
         const currentBranch = (await $`git rev-parse --abbrev-ref HEAD`.text()).trim();
 
         console.log(`Current branch: ${currentBranch}`);
 
         // Get the last commit message and trim to its first line
         const lastCommitMessage = (await $`git log -1 --pretty=%B`.text()).trim().split('\n')[0];
-        const commitMessage = `Update logs - ${lastCommitMessage}`;
+        const commitMessage = `bgr - ${lastCommitMessage}`;
 
         console.log(`Commit message: ${commitMessage}`);
 
@@ -103,18 +108,22 @@ async function reloadThenExecuteAndCommitLogs() {
           await $`git checkout ${branchName}`;
         }
 
-        console.log(`Writing log to ${newLogFilePath} and ${latestLogFilePath}`);
-        await Bun.write(newLogFilePath, new Blob([stdout]));
-        await Bun.write(latestLogFilePath, new Blob([stdout]));
+        try {
+          console.log(`Writing log to ${newLogFilePath} and ${latestLogFilePath}`);
+          await Bun.write(newLogFilePath, new Blob([stdout]));
+          await Bun.write(latestLogFilePath, new Blob([stdout]));
 
-        console.log("Adding log files to git...");
-        await $`git add ${newLogFilePath} ${latestLogFilePath}`;
-        await $`git commit -m "${commitMessage} - ${getFormattedTime()}"`;
-        console.log("Pushing changes to remote...");
-        await $`git push -u origin ${branchName}`;
-
-        console.log(`Switching back to original branch: ${currentBranch}`);
-        await $`git checkout ${currentBranch}`;
+          console.log("Adding log files to git...");
+          await $`git add ${newLogFilePath} ${latestLogFilePath}`;
+          await $`git commit -m "${commitMessage} - ${getFormattedTime()}"`;
+          console.log("Pushing changes to remote...");
+          await $`git push -u ${remoteName} ${branchName}`;
+        } catch (err) {
+          console.error("Error during git operations:", err);
+        } finally {
+          console.log(`Switching back to original branch: ${currentBranch}`);
+          await $`git checkout ${currentBranch}`;
+        }
       } else {
         console.log("No changes detected. Waiting for next cycle...");
       }
@@ -123,7 +132,7 @@ async function reloadThenExecuteAndCommitLogs() {
     }
 
     console.log("Sleeping for 5 seconds...");
-    await Bun.sleep(5 * 1000);
+    await sleep(5 * 1000);
   }
 }
 
