@@ -1,6 +1,7 @@
-import { $, sleep } from "bun";
+import { $, sleep, write, file } from "bun";
 import { join } from "path";
-import { file } from "bun";
+import { watch } from "fs/promises";
+
 
 // Get the current working directory of where the script is executed
 const repoDirectory = (await $`git rev-parse --show-toplevel`.text()).trim();
@@ -8,16 +9,16 @@ const logDirectory = join(repoDirectory, 'bgr-output');
 
 // Get the remote name from environment variable or use default
 const remoteName = process.env.GIT_REMOTE_NAME || "7flash";
-console.log(`🔗 Using git remote: ${remoteName}`);
+console.log(`Using git remote: ${remoteName}`);
 
 // Read package.json to get the refresh command
 const packageJsonPath = join(repoDirectory, 'package.json');
-const packageJsonBlob = file(packageJsonPath);
+const packageJsonBlob = Bun.file(packageJsonPath);
 
 let packageJson: any;
 
 try {
-  console.log(`📄 Reading package.json from ${packageJsonPath}...`);
+  console.log(`📖 Reading package.json from ${packageJsonPath}...`);
   packageJson = JSON.parse(await packageJsonBlob.text());
   console.log("✅ Successfully parsed package.json.");
 } catch (err) {
@@ -63,41 +64,51 @@ function getFormattedTime(): string {
 
 async function reloadThenExecuteAndCommitLogs() {
   let firstRun = true;
+  let lastUpdate = '';
 
   while (true) {
     try {
-      console.log("🔄 Fetching latest changes...");
+<<<<<<< HEAD
+      console.log("🔍 Fetching latest changes...");
+      await $`git fetch`;
+=======
+      console.log("Fetching latest changes...");
       await $`git fetch ${remoteName}`;
+>>>>>>> oct11
 
       const localHash = (await $`git rev-parse @`.text()).trim();
       const remoteHash = (await $`git rev-parse ${remoteName}/$(git rev-parse --abbrev-ref HEAD)`.text()).trim();
 
-      console.log(`🔍 Local hash: ${localHash}`);
-      console.log(`🔍 Remote hash: ${remoteHash}`);
-
       if (localHash !== remoteHash || firstRun) {
         firstRun = false;
+<<<<<<< HEAD
         console.log("⬇️ Pulling latest changes...");
-        await $`git pull ${remoteName} $(git rev-parse --abbrev-ref HEAD)`;
+        await $`git pull`;
 
         console.log(`🚀 Executing command: ${command}`);
-        let stdout = await $`${{ raw: command }} 2>&1`.nothrow().text();
-        console.log(`📜 Command output: ${stdout}`);
+        let stdout = await $`${{ raw: command }} 2>&1`.text();
+        console.log(`💬 Command output: ${stdout}`);
 
         const logFileName = `log_${getFormattedTime().replace(/[: ]/g, '_')}.txt`;
+        const latestLogFilePath = join(logDirectory, "latest-logs.txt");
+=======
+        console.log("Pulling latest changes...");
+        await $`git pull ${remoteName} $(git rev-parse --abbrev-ref HEAD)`;
+
+        console.log(`Executing command: ${command}`);
+        let stdout = await $`${{ raw: command }} 2>&1`.nothrow().text();
+        console.log(`Command output: ${stdout}`);
+
+        const logFileName = `log_${getFormattedTime()}.txt`;
         const latestLogFilePath = join(logDirectory, "latest.txt");
+>>>>>>> oct11
         const newLogFilePath = join(logDirectory, logFileName);
 
         const branchName = "bgr";
         const currentBranch = (await $`git rev-parse --abbrev-ref HEAD`.text()).trim();
 
-        console.log(`🌿 Current branch: ${currentBranch}`);
-
-        // Get the last commit message and trim to its first line
         const lastCommitMessage = (await $`git log -1 --pretty=%B`.text()).trim().split('\n')[0];
         const commitMessage = `bgr - ${lastCommitMessage}`;
-
-        console.log(`📝 Commit message: ${commitMessage}`);
 
         try {
           console.log(`🌿 Creating and switching to branch: ${branchName}`);
@@ -107,37 +118,58 @@ async function reloadThenExecuteAndCommitLogs() {
           await $`git checkout ${branchName}`;
         }
 
+<<<<<<< HEAD
+        console.log(`📝 Writing log to ${newLogFilePath} and ${latestLogFilePath}`);
+        await Bun.write(newLogFilePath, new Blob([stdout]));
+        await Bun.write(latestLogFilePath, new Blob([stdout]));
+
+        console.log("📂 Adding log files to git...");
+        await $`git add ${newLogFilePath} ${latestLogFilePath}`;
+        await $`git commit -m "${commitMessage} - ${getFormattedTime()}"`;
+        console.log("📤 Pushing changes to remote...");
+        await $`git push -u origin ${branchName}`;
+
+        console.log(`🔙 Switching back to original branch: ${currentBranch}`);
+        await $`git checkout ${currentBranch}`;
+
+        lastUpdate = `Last update at ${getFormattedTime()} with hash ${localHash}`;
+=======
         try {
-          console.log(`💾 Writing log to ${newLogFilePath} and ${latestLogFilePath}`);
+          console.log(`Writing log to ${newLogFilePath} and ${latestLogFilePath}`);
           await Bun.write(newLogFilePath, new Blob([stdout]));
           await Bun.write(latestLogFilePath, new Blob([stdout]));
 
-          console.log("➕ Adding log files to git...");
+          console.log("Adding log files to git...");
           await $`git add ${newLogFilePath} ${latestLogFilePath}`;
           await $`git commit -m "${commitMessage} - ${getFormattedTime()}"`;
-          console.log("🔼 Pushing changes to remote...");
+          console.log("Pushing changes to remote...");
           await $`git push -u ${remoteName} ${branchName}`;
         } catch (err) {
-          console.error("❌ Error during git operations:", err);
+          console.error("Error during git operations:", err);
         } finally {
-          console.log(`🔄 Switching back to original branch: ${currentBranch}`);
+          console.log(`Switching back to original branch: ${currentBranch}`);
           await $`git checkout ${currentBranch}`;
         }
+>>>>>>> oct11
       } else {
-        console.log("🔍 No changes detected.");
+        // Update the terminal line with the last update information
+        process.stdout.write(`\r⏱️ ${lastUpdate}`);
       }
-
-      // Update the terminal line with the date of the last update and hash
-      process.stdout.write(`⏳ Last checked at ${getFormattedTime()} | Local: ${localHash} | Remote: ${remoteHash}\r`);
     } catch (err) {
       console.error("❌ Error during reload and execute cycle:", err);
     }
 
+<<<<<<< HEAD
+    await new Promise(resolve => setTimeout(resolve, 1000)); // Avoid busy waiting
+=======
+    console.log("Sleeping for 5 seconds...");
     await sleep(5 * 1000);
+>>>>>>> oct11
   }
 }
 
 if (import.meta.path === Bun.main) {
-  console.log("🚀 Starting the reload and execute cycle...");
+  console.log("🔄 Starting the reload and execute cycle...");
   reloadThenExecuteAndCommitLogs();
 }
+
