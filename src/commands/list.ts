@@ -1,20 +1,23 @@
 import chalk from "chalk";
 import { renderProcessTable } from "../table";
 import type { ProcessTableRow } from "../table";
-import { bgrHome, dbPath, getAllProcesses, getDbInfo, updateProcessPid } from "../db";
+import { getAllProcesses, updateProcessPid } from "../db";
 import { announce } from "../logger";
-import { calculateRuntime, isInternalProcessName, parseEnvString } from "../utils";
+import {
+  isProcessRunning,
+  calculateRuntime,
+  parseEnvString,
+  isInternalProcessName,
+} from "../utils";
 import {
   getProcessBatchResources,
-  getProcessPorts,
-  isProcessRunning,
   reconcileProcessPids,
+  resolvePidWithPorts,
 } from "../platform";
 
-type ListOptions = {
+type ShowAllOptions = {
   json?: boolean;
   jsonFull?: boolean;
-  jsonMeta?: boolean;
   filter?: string;
 };
 
@@ -25,7 +28,17 @@ function formatMemory(bytes: number): string {
   return `${Math.round(mb)} MB`;
 }
 
-function latestVisibleProcesses() {
+function isPidAliveFast(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getFilteredProcesses(opts?: ShowAllOptions) {
   const processes = getAllProcesses();
   const latestByName = new Map<string, (typeof processes)[number]>();
 
@@ -44,86 +57,63 @@ function latestVisibleProcesses() {
     }
   }
 
-  return [...latestByName.values()].filter((proc) => !isInternalProcessName(proc.name));
-}
-
-function filterByGroup<T extends { env: string }>(rows: T[], filter?: string): T[] {
-  if (!filter) return rows;
-  return rows.filter((proc) => {
+  return Array.from(latestByName.values()).filter((proc) => {
+    if (isInternalProcessName(proc.name)) return false;
+    if (!opts?.filter) return true;
     const envVars = parseEnvString(proc.env);
-    return envVars["BGR_GROUP"] === filter;
+    return envVars["BGR_GROUP"] === opts.filter;
   });
 }
 
-/**
- * Very fast PID existence check used by the default JSON path.
- *
- * This intentionally avoids command-line verification, port discovery, memory
- * checks, and Windows PowerShell reconciliation. `--json` is commonly used by
- * scripts/guards and must return quickly.
- *
- * For command-verified status, ports, memory, and PID reconciliation, use:
- *   bgrun --json-full
- */
-function isPidAliveFast(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+function parentNameFromEnv(envVars: Record<string, string>): string {
+  return String(envVars.BGR_PARENT_NAME ?? envVars.BGRUN_PARENT_NAME ?? "");
 }
 
-function getListMeta(rows: unknown[]) {
-  return {
-    dbPath,
-    bgrHome,
-    bgrunDbEnv: process.env.BGRUN_DB ?? null,
-    processCount: rows.length,
-    generatedAt: new Date().toISOString(),
-  };
-}
-
-function fastJsonRows(opts?: ListOptions) {
-  const rows = filterByGroup(latestVisibleProcesses(), opts?.filter);
-
-  return rows.map((proc) => {
-    const env = parseEnvString(proc.env);
+function printFastJson(filtered: ReturnType<typeof getFilteredProcesses>) {
+  const jsonData = filtered.map((proc) => {
+    const envVars = parseEnvString(proc.env);
     const running = isPidAliveFast(proc.pid);
-
     return {
-      id: proc.id,
-      name: proc.name,
       pid: proc.pid,
+      name: proc.name,
       status: running ? "running" : "stopped",
       statusSource: "pid-fast",
       healthChecked: false,
       commandVerified: false,
-      parentName: String(env.BGR_PARENT_NAME ?? env.BGRUN_PARENT_NAME ?? ""),
-      group: env.BGR_GROUP ?? null,
+      parentName: parentNameFromEnv(envVars),
+      group: envVars.BGR_GROUP ?? null,
       command: proc.command,
       workdir: proc.workdir,
-      cwd: proc.workdir,
       directory: proc.workdir,
-      env,
-      stdout_path: proc.stdout_path,
-      stderr_path: proc.stderr_path,
-      timestamp: proc.timestamp,
       runtime: calculateRuntime(proc.timestamp),
+      timestamp: proc.timestamp,
+      env: envVars,
     };
   });
+
+  console.log(JSON.stringify(jsonData, null, 2));
 }
 
-async function fullJsonRows(opts?: ListOptions) {
-  const rows = filterByGroup(latestVisibleProcesses(), opts?.filter);
+export async function showAll(opts?: ShowAllOptions) {
+  const filtered = getFilteredProcesses(opts);
 
-  // PID reconciliation is intentionally only in the full/interactive path.
+  // Keep `bgrun --json` fast. Scripts and guards often call it, so it must
+  // not block on command-line verification, port discovery, memory checks,
+  // or Windows PID reconciliation. Use `--json-full` for the slower rich path.
+  if (opts?.json && !opts?.jsonFull) {
+    printFastJson(filtered);
+    return;
+  }
+
+  // ─── PID Reconciliation ──────────────────────────────────────────
+  // On Windows, the stored PID may be a dead cmd.exe wrapper while the
+  // actual bun.exe child is still running. Detect dead PIDs up-front,
+  // reconcile them in one batch PowerShell call, and patch the DB so
+  // subsequent invocations are stable (no flicker).
   const deadPids = new Set<number>();
   const aliveCache = new Map<number, boolean>();
 
-  for (const proc of rows) {
+  for (const proc of filtered) {
     const alive = await isProcessRunning(proc.pid, proc.command);
     aliveCache.set(proc.pid, alive);
     if (!alive && proc.pid > 0) deadPids.add(proc.pid);
@@ -131,7 +121,7 @@ async function fullJsonRows(opts?: ListOptions) {
 
   if (deadPids.size > 0) {
     const reconciled = await reconcileProcessPids(
-      rows.map((p) => ({
+      filtered.map((p) => ({
         name: p.name,
         pid: p.pid,
         command: p.command,
@@ -142,106 +132,129 @@ async function fullJsonRows(opts?: ListOptions) {
 
     for (const [name, newPid] of reconciled) {
       updateProcessPid(name, newPid);
-      const proc = rows.find((p) => p.name === name);
+      const proc = filtered.find((p) => p.name === name);
       if (proc) {
-        aliveCache.delete(proc.pid);
-        proc.pid = newPid;
+        (proc as any).pid = newPid;
         aliveCache.set(newPid, true);
       }
     }
   }
+  // ─────────────────────────────────────────────────────────────────
 
-  const resources = await getProcessBatchResources(rows.map((p) => p.pid));
+  if (opts?.json) {
+    const jsonData: any[] = [];
 
-  return await Promise.all(
-    rows.map(async (proc) => {
-      const env = parseEnvString(proc.env);
-      const alive =
-        aliveCache.get(proc.pid) ?? (await isProcessRunning(proc.pid, proc.command));
-      const ports = alive ? await getProcessPorts(proc.pid) : [];
-      const resource = resources.get(proc.pid);
+    for (const proc of filtered) {
+      const isRunning =
+        aliveCache.get(proc.pid) ??
+        (await isProcessRunning(proc.pid, proc.command));
+      const envVars = parseEnvString(proc.env);
 
-      return {
-        id: proc.id,
+      let displayPid = proc.pid;
+      let ports: number[] = [];
+      if (isRunning) {
+        const resolved = await resolvePidWithPorts(proc.pid);
+        displayPid = resolved.pid;
+        ports = resolved.ports;
+        if (displayPid !== proc.pid) {
+          updateProcessPid(proc.name, displayPid);
+          (proc as any).pid = displayPid;
+        }
+      }
+
+      jsonData.push({
+        pid: displayPid,
         name: proc.name,
-        pid: proc.pid,
-        status: alive ? "running" : "stopped",
+        ports: ports.length > 0 ? ports : undefined,
+        status: isRunning ? "running" : "stopped",
         statusSource: "command-verified",
         healthChecked: true,
         commandVerified: true,
-        parentName: String(env.BGR_PARENT_NAME ?? env.BGRUN_PARENT_NAME ?? ""),
-        group: env.BGR_GROUP ?? null,
+        parentName: parentNameFromEnv(envVars),
+        group: envVars.BGR_GROUP ?? null,
         command: proc.command,
         workdir: proc.workdir,
-        cwd: proc.workdir,
         directory: proc.workdir,
-        env,
-        port: ports.join(", "),
-        ports,
-        memory: resource?.memory ?? 0,
-        memoryText: formatMemory(resource?.memory ?? 0),
-        stdout_path: proc.stdout_path,
-        stderr_path: proc.stderr_path,
-        timestamp: proc.timestamp,
         runtime: calculateRuntime(proc.timestamp),
-      };
-    }),
-  );
-}
-
-export async function showAll(opts?: ListOptions) {
-  if (opts?.json) {
-    const rows = opts.jsonFull ? await fullJsonRows(opts) : fastJsonRows(opts);
-
-    if (opts.jsonMeta) {
-      console.log(
-        JSON.stringify(
-          {
-            meta: {
-              ...getListMeta(rows),
-              mode: opts.jsonFull ? "full" : "fast",
-              dbInfo: getDbInfo(),
-            },
-            processes: rows,
-          },
-          null,
-          2,
-        ),
-      );
-      return;
+        timestamp: proc.timestamp,
+        env: envVars,
+      });
     }
 
-    // Backward-compatible array output for scripts:
-    //   bunx bgrun --json | ConvertFrom-Json
-    console.log(JSON.stringify(rows, null, 2));
+    console.log(JSON.stringify(jsonData, null, 2));
     return;
   }
 
-  // Interactive/table path keeps the richer full status.
-  const rows = await fullJsonRows(opts);
+  const tableData: ProcessTableRow[] = [];
+  const allPids = filtered.map((p) => p.pid);
+  const resourceMap = await getProcessBatchResources(allPids);
 
-  if (rows.length === 0) {
-    announce(
-      `No processes found.\n\nDB: ${dbPath}\nBGRUN_DB: ${process.env.BGRUN_DB ?? "(default bgrun.sqlite)"}`,
-      "No Processes",
-    );
-    return;
-  }
+  for (const proc of filtered) {
+    const isRunning =
+      aliveCache.get(proc.pid) ??
+      (await isProcessRunning(proc.pid, proc.command));
+    const runtime = calculateRuntime(proc.timestamp);
 
-  const tableRows: ProcessTableRow[] = rows.map((proc: any) => ({
-    id: proc.id,
-    pid: proc.pid,
-    name: proc.name,
-    port: proc.port || "",
-    command: proc.command,
-    workdir: proc.workdir,
-    status:
-      proc.status === "running"
+    let displayPid = proc.pid;
+    let ports: number[] = [];
+    if (isRunning) {
+      const resolved = await resolvePidWithPorts(proc.pid);
+      displayPid = resolved.pid;
+      ports = resolved.ports;
+      if (displayPid !== proc.pid) {
+        updateProcessPid(proc.name, displayPid);
+        (proc as any).pid = displayPid;
+      }
+    }
+
+    const mem = isRunning
+      ? resourceMap.get(displayPid)?.memory ||
+        resourceMap.get(proc.pid)?.memory ||
+        0
+      : 0;
+    tableData.push({
+      id: proc.id,
+      pid: displayPid,
+      name: proc.name,
+      port: ports.length > 0 ? ports.map((p) => `:${p}`).join(",") : "-",
+      memory: formatMemory(mem),
+      command: proc.command,
+      workdir: proc.workdir,
+      status: isRunning
         ? chalk.green.bold("● Running")
         : chalk.red.bold("○ Stopped"),
-    runtime: proc.runtime,
-    memory: proc.memoryText,
-  }));
+      runtime: runtime,
+    });
+  }
 
-  console.log(renderProcessTable(tableRows));
+  if (tableData.length === 0) {
+    if (opts?.filter) {
+      announce(
+        `No processes matched filter BGR_GROUP='${opts.filter}'.`,
+        "No Matches",
+      );
+    } else {
+      announce("No processes found.", "Empty");
+    }
+    return;
+  }
+
+  const tableOutput = renderProcessTable(tableData, {
+    padding: 1,
+    borderStyle: "rounded",
+    showHeaders: true,
+  });
+  console.log(tableOutput);
+
+  const runningCount = tableData.filter((p) =>
+    p.status.includes("Running"),
+  ).length;
+  const stoppedCount = tableData.filter((p) =>
+    p.status.includes("Stopped"),
+  ).length;
+  console.log(
+    chalk.cyan(
+      `Total: ${tableData.length} processes (${chalk.green(`${runningCount} running`)}, ${chalk.red(`${stoppedCount} stopped`)})`,
+    ),
+  );
 }

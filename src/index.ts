@@ -4,6 +4,8 @@ import { parseArgs } from "util";
 import { getVersion } from "./utils";
 import { handleRun } from "./commands/run";
 import { showAll } from "./commands/list";
+import { handleMeta } from "./commands/meta";
+import { handleDoctor } from "./commands/doctor";
 import {
   handleDelete,
   handleClean,
@@ -136,6 +138,12 @@ async function showHelp() {
 
     ${chalk.yellow("Commands:")}
       bunx bgrun                     List all processes
+      bunx bgrun --json              Fast JSON process list
+      bunx bgrun --json-full         Full JSON list with verified status, ports, memory
+      bunx bgrun --meta              Show DB/runtime metadata only
+      bunx bgrun --meta --json       Machine-readable DB/runtime metadata only
+      bunx bgrun --doctor            Metadata plus process registry names
+      bunx bgrun --doctor --json     Machine-readable diagnostics
       bunx bgrun [name]             Show details for a process
       bunx bgrun -- <cmd>           Start a managed process named from the working directory
       bunx bgrun inline -- <cmd>    Run a command in this terminal with config env loaded
@@ -221,6 +229,9 @@ const cliArgOptions = {
   "stop-all": { type: "boolean" as const },
   clean: { type: "boolean" as const },
   json: { type: "boolean" as const, short: "j" },
+  "json-full": { type: "boolean" as const },
+  meta: { type: "boolean" as const },
+  doctor: { type: "boolean" as const },
   logs: { type: "boolean" as const, short: "l" },
   "log-stdout": { type: "boolean" as const },
   "log-stderr": { type: "boolean" as const },
@@ -266,6 +277,9 @@ async function run() {
       values.watch ||
       values.hot ||
       values.json ||
+      values["json-full"] ||
+      values.meta ||
+      values.doctor ||
       values.filter,
     );
   };
@@ -395,6 +409,24 @@ async function run() {
     allowPositionals: true,
   });
 
+  const wantsJson = values.json === true || rawArgs.includes("--json");
+  const wantsJsonFull =
+    values["json-full"] === true || rawArgs.includes("--json-full");
+  const wantsMeta = values.meta === true || rawArgs.includes("--meta");
+  const wantsDoctor = values.doctor === true || rawArgs.includes("--doctor");
+
+  // Top-level metadata/diagnostic commands must run before the default
+  // no-positionals branch, otherwise `bgrun --meta` falls through to list.
+  if (wantsMeta) {
+    handleMeta({ json: wantsJson });
+    return;
+  }
+
+  if (wantsDoctor) {
+    handleDoctor({ json: wantsJson });
+    return;
+  }
+
   if (values.env) {
     if (positionals.length > 1) {
       error(
@@ -490,7 +522,7 @@ async function run() {
 
     // Check if dashboard is already running
     const existing = getProcess(dashboardName);
-    if (existing && (await isProcessRunning(existing.pid, existing.command))) {
+    if (existing && (await isProcessRunning(existing.pid))) {
       // The stored PID may be a shell wrapper. Resolve toward the child that
       // actually owns the listening socket before rendering the banner.
       const resolved = await resolvePidWithPorts(existing.pid);
@@ -526,7 +558,7 @@ async function run() {
 
     // Kill existing if force
     if (existing) {
-      if (await isProcessRunning(existing.pid, existing.command)) {
+      if (await isProcessRunning(existing.pid)) {
         const detectedPorts = await getProcessPorts(existing.pid);
         await terminateProcess(existing.pid);
         for (const p of detectedPorts) {
@@ -598,7 +630,7 @@ async function run() {
           (await findChildPid(newProcess.pid)))
         : await findChildPid(newProcess.pid);
 
-    if (!(await isProcessRunning(actualPid, command))) {
+    if (!(await isProcessRunning(actualPid))) {
       const detachedPid = await findDetachedProcessByArg("--_serve");
       if (detachedPid) actualPid = detachedPid;
     }
@@ -764,7 +796,7 @@ async function run() {
     console.log(chalk.bold(`\n  Stopping ${all.length} processes...\n`));
     for (const proc of all) {
       try {
-        if (await isProcessRunning(proc.pid, proc.command)) {
+        if (await isProcessRunning(proc.pid)) {
           console.log(
             chalk.yellow(`  ■ Stopping ${proc.name} (PID ${proc.pid})...`),
           );
@@ -862,7 +894,8 @@ async function run() {
   // Explicit "list" command
   if (name === "list") {
     await showAll({
-      json: values.json as boolean | undefined,
+      json: (values.json as boolean | undefined) || wantsJsonFull,
+      jsonFull: wantsJsonFull,
       filter: values.filter as string | undefined,
     });
     return;
@@ -943,7 +976,8 @@ async function run() {
       error("Process name is required.");
     }
     await showAll({
-      json: values.json as boolean | undefined,
+      json: (values.json as boolean | undefined) || wantsJsonFull,
+      jsonFull: wantsJsonFull,
       filter: values.filter as string | undefined,
     });
   }
