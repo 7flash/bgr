@@ -41,7 +41,9 @@ import { syncProcessWatcher } from "../watcher";
 const homePath = getHomeDir();
 const run = createMeasure("run");
 const INTERNAL_BUNX_PREFIX = "bunx bgrun";
-const STARTUP_HEALTH_GRACE_MS = Number(Bun.env.BGR_STARTUP_HEALTH_GRACE_MS || "1500");
+const STARTUP_HEALTH_GRACE_MS = Number(
+  Bun.env.BGR_STARTUP_HEALTH_GRACE_MS || "1500",
+);
 const BGR_PROCESS_NAME_ENV = "BGR_PROCESS_NAME";
 const BGR_PARENT_NAME_ENV = "BGR_PARENT_NAME";
 
@@ -87,7 +89,9 @@ function formatStartupFailureMessage(
   const logSections = [
     stderrTail ? `\nstderr tail:\n${stderrTail}` : "",
     stdoutTail ? `\nstdout tail:\n${stdoutTail}` : "",
-  ].filter(Boolean).join("\n");
+  ]
+    .filter(Boolean)
+    .join("\n");
 
   return (
     `Process "${name}" failed to stay running after launch. ` +
@@ -98,7 +102,11 @@ function formatStartupFailureMessage(
   );
 }
 
-async function waitForStartupHealth(pid: number, command: string, graceMs = STARTUP_HEALTH_GRACE_MS): Promise<boolean> {
+async function waitForStartupHealth(
+  pid: number,
+  command: string,
+  graceMs = STARTUP_HEALTH_GRACE_MS,
+): Promise<boolean> {
   if (pid <= 0) return false;
   const deadline = Date.now() + Math.max(0, graceMs);
 
@@ -135,7 +143,7 @@ async function resolveSpawnedProcessPid(
       candidatePid = descendantPid;
     }
 
-    if (candidatePid > 0 && await isProcessRunning(candidatePid, command)) {
+    if (candidatePid > 0 && (await isProcessRunning(candidatePid, command))) {
       return candidatePid;
     }
 
@@ -147,7 +155,7 @@ async function resolveSpawnedProcessPid(
     new Set([parentPid]),
   );
   const matchedPid = reconciled.get("__spawn__") ?? 0;
-  if (matchedPid > 0 && await isProcessRunning(matchedPid, command)) {
+  if (matchedPid > 0 && (await isProcessRunning(matchedPid, command))) {
     return matchedPid;
   }
 
@@ -156,11 +164,11 @@ async function resolveSpawnedProcessPid(
       const commandParts = command
         .toLowerCase()
         .split(/\s+/)
-        .map(part => part.trim())
-        .filter(part => part.length > 2);
+        .map((part) => part.trim())
+        .filter((part) => part.length > 2);
       const output = await psExec(
         `Get-CimInstance Win32_Process -Filter "Name='bun.exe'" | ` +
-        `ForEach-Object { Write-Output "$($_.ProcessId)|$($_.ParentProcessId)|$($_.CreationDate)|$($_.CommandLine)" }`,
+          `ForEach-Object { Write-Output "$($_.ProcessId)|$($_.ParentProcessId)|$($_.CreationDate)|$($_.CommandLine)" }`,
         5000,
       );
 
@@ -183,7 +191,10 @@ async function resolveSpawnedProcessPid(
           if (candidateCommand.includes(part)) score += 2;
         }
         if (candidateCommand.includes("run server.ts")) score += 2;
-        if (candidateCommand.includes(workdir.toLowerCase().replace(/\\/g, "/"))) score += 4;
+        if (
+          candidateCommand.includes(workdir.toLowerCase().replace(/\\/g, "/"))
+        )
+          score += 4;
         if (candidateCommand.includes(workdir.toLowerCase())) score += 4;
 
         const createdAt = creationDateRaw ? Date.parse(creationDateRaw) : NaN;
@@ -193,7 +204,7 @@ async function resolveSpawnedProcessPid(
           else if (ageMs <= 60_000) score += 2;
         }
 
-        if (score > bestScore && await isProcessRunning(pid, command)) {
+        if (score > bestScore && (await isProcessRunning(pid, command))) {
           bestScore = score;
           bestPid = pid;
         }
@@ -305,7 +316,10 @@ export async function handleRun(options: CommandOptions) {
         });
       }
 
-      const isRunning = await isProcessRunning(existingProcess.pid, existingProcess.command);
+      const isRunning = await isProcessRunning(
+        existingProcess.pid,
+        existingProcess.command,
+      );
       if (isRunning && !force) {
         error(
           `Process '${name}' is currently running. Use --force to restart.`,
@@ -341,7 +355,10 @@ export async function handleRun(options: CommandOptions) {
       // Detect ports BEFORE killing so we can clean them up
       // Use actualPid which may have been reconciled from a dead wrapper to a live child
       let detectedPorts: number[] = [];
-      const actuallyRunning = await isProcessRunning(actualPid, existingProcess.command);
+      const actuallyRunning = await isProcessRunning(
+        actualPid,
+        existingProcess.command,
+      );
       if (actuallyRunning) {
         detectedPorts = await getProcessPorts(actualPid);
       }
@@ -548,8 +565,13 @@ export async function handleRun(options: CommandOptions) {
         );
       })) ?? 0;
 
-    if (actualPid <= 0 || !(await waitForStartupHealth(actualPid, finalCommand!))) {
-      throw new Error(formatStartupFailureMessage(name!, stdoutPath, stderrPath));
+    if (
+      actualPid <= 0 ||
+      !(await waitForStartupHealth(actualPid, finalCommand!))
+    ) {
+      throw new Error(
+        formatStartupFailureMessage(name!, stdoutPath, stderrPath),
+      );
     }
 
     await retryDatabaseOperation(() =>

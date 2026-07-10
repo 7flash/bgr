@@ -1,0 +1,36 @@
+diff --git a/src/index.ts b/src/index.ts
+--- a/src/index.ts
++++ b/src/index.ts
+@@
+ import { showAll } from "./commands/list";
++import { handleDoctor } from "./commands/doctor";
+@@
+       json: {
+         type: "boolean",
+       },
++      "json-full": {
++        type: "boolean",
++      },
++      "json-meta": {
++        type: "boolean",
++      },
++      doctor: {
++        type: "boolean",
++      },
+@@
+-    if (values.json || positionals.length === 0) {
+-      await showAll({ json: values.json as boolean, filter: values.filter as string | undefined });
++    if (values.doctor) {
++      handleDoctor({ json: values.json as boolean });
++      return;
++    }
++
++    if (values.json || positionals.length === 0) {
++      await showAll({
++        json: values.json as boolean,
++        jsonFull: values["json-full"] as boolean,
++        jsonMeta: values["json-meta"] as boolean,
++        filter: values.filter as string | undefined,
++      });
+       return;
+     }

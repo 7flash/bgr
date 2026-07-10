@@ -45,29 +45,39 @@ const sampleColumns: TableColumn[] = [
   { key: "runtime", header: "Runtime" },
 ];
 
-
 describe("Table Rendering Utilities", () => {
-
   // --- Tests for the core width calculation logic ---
   describe("calculateColumnWidths", () => {
-
     test("should return natural widths when content fits", () => {
       const maxWidth = 200; // Ample width
-      const widths = calculateColumnWidths(sampleProcesses, sampleColumns, maxWidth);
+      const widths = calculateColumnWidths(
+        sampleProcesses,
+        sampleColumns,
+        maxWidth,
+      );
 
       // The 'name' column should have its full, natural width
-      const nameNaturalWidth = "long-process-name-that-will-certainly-be-truncated".length;
+      const nameNaturalWidth =
+        "long-process-name-that-will-certainly-be-truncated".length;
       expect(widths.get("name")).toBe(nameNaturalWidth);
     });
 
     test("should shrink columns when content overflows", () => {
       const maxWidth = 100; // Restricted width
-      const widths = calculateColumnWidths(sampleProcesses, sampleColumns, maxWidth);
+      const widths = calculateColumnWidths(
+        sampleProcesses,
+        sampleColumns,
+        maxWidth,
+      );
 
-      const totalWidth = Array.from(widths.values()).reduce((sum, w) => sum + w, 0);
+      const totalWidth = Array.from(widths.values()).reduce(
+        (sum, w) => sum + w,
+        0,
+      );
 
       // Natural width of the longest name
-      const nameNaturalWidth = "long-process-name-that-will-certainly-be-truncated".length;
+      const nameNaturalWidth =
+        "long-process-name-that-will-certainly-be-truncated".length;
 
       // Check that the 'name' column was shrunk
       expect(widths.get("name")).toBeLessThan(nameNaturalWidth);
@@ -78,7 +88,6 @@ describe("Table Rendering Utilities", () => {
 
   // --- Tests for the main exported table rendering function ---
   describe("renderProcessTable", () => {
-
     test("should render a table without a vertical tree when width is sufficient", () => {
       // Use only short data and provide ample width
       const shortData = [sampleProcesses[0]];
@@ -99,7 +108,9 @@ describe("Table Rendering Utilities", () => {
       expect(output).toContain("…"); // Ellipsis from truncation
 
       // The full, untruncated name should appear in the vertical tree section
-      expect(output).toContain("long-process-name-that-will-certainly-be-truncated");
+      expect(output).toContain(
+        "long-process-name-that-will-certainly-be-truncated",
+      );
     });
 
     test("should return a message for an empty data array", () => {

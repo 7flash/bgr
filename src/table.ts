@@ -62,7 +62,9 @@ export function truncatePath(str: string, maxLength: number): string {
   const targetLength = maxLength - ellipsis.length;
   const startLen = Math.ceil(targetLength / 2);
   const endLen = Math.floor(targetLength / 2);
-  return str.substring(0, startLen) + ellipsis + str.substring(str.length - endLen);
+  return (
+    str.substring(0, startLen) + ellipsis + str.substring(str.length - endLen)
+  );
 }
 
 // Calculate column widths by proportionally shrinking the widest columns
@@ -70,7 +72,7 @@ export function calculateColumnWidths(
   rows: any[],
   columns: TableColumn[],
   maxWidth: number,
-  padding: number = 2
+  padding: number = 2,
 ): Map<string, number> {
   const separatorsWidth = columns.length + 1;
   const paddingWidth = padding * columns.length;
@@ -82,13 +84,18 @@ export function calculateColumnWidths(
   for (const col of columns) {
     let maxNatural = stripAnsi(col.header).length;
     for (const row of rows) {
-      const value = col.formatter ? col.formatter(row[col.key]) : String(row[col.key] || "");
+      const value = col.formatter
+        ? col.formatter(row[col.key])
+        : String(row[col.key] || "");
       maxNatural = Math.max(maxNatural, stripAnsi(value).length);
     }
     naturalWidths.set(col.key, maxNatural);
   }
 
-  const totalNaturalWidth = Array.from(naturalWidths.values()).reduce((sum, w) => sum + w, 0);
+  const totalNaturalWidth = Array.from(naturalWidths.values()).reduce(
+    (sum, w) => sum + w,
+    0,
+  );
 
   // 2. If it fits, we're done
   if (totalNaturalWidth <= availableWidth) {
@@ -123,7 +130,11 @@ export function calculateColumnWidths(
   return currentWidths;
 }
 
-function renderBorder(widths: number[], padding: number, style: string[]): string {
+function renderBorder(
+  widths: number[],
+  padding: number,
+  style: string[],
+): string {
   const [left, mid, right, line] = style;
   let lineStr = left;
   for (let i = 0; i < widths.length; i++) {
@@ -139,10 +150,16 @@ function renderBorder(widths: number[], padding: number, style: string[]): strin
 export function renderHorizontalTable(
   rows: any[],
   columns: TableColumn[],
-  options: TableOptions = {}
+  options: TableOptions = {},
 ): { table: string; truncatedIndices: number[] } {
-  const { maxWidth = getTerminalWidth(), padding = 2, borderStyle = "rounded", showHeaders = true } = options;
-  if (rows.length === 0) return { table: chalk.gray("No data to display"), truncatedIndices: [] };
+  const {
+    maxWidth = getTerminalWidth(),
+    padding = 2,
+    borderStyle = "rounded",
+    showHeaders = true,
+  } = options;
+  if (rows.length === 0)
+    return { table: chalk.gray("No data to display"), truncatedIndices: [] };
 
   const borderChars: Record<string, string[]> = {
     rounded: ["╭", "┬", "╮", "─", "│", "├", "┼", "┤", "╰", "┴", "╯"],
@@ -150,41 +167,63 @@ export function renderHorizontalTable(
     double: ["╔", "╦", "╗", "═", "║", "╠", "╬", "╣", "╚", "╩", "╝"],
     none: [" ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " "],
   };
-  const [tl, tc, tr, h, v, ml, mc, mr, bl, bc, br] = borderChars[borderStyle] ?? borderChars.rounded;
+  const [tl, tc, tr, h, v, ml, mc, mr, bl, bc, br] =
+    borderChars[borderStyle] ?? borderChars.rounded;
   const columnWidths = calculateColumnWidths(rows, columns, maxWidth, padding);
   const widthArray = columns.map((col) => columnWidths.get(col.key)!);
   const truncatedIndices = new Set<number>();
   const lines: string[] = [];
   const cellPadding = " ".repeat(padding / 2);
 
-  if (borderStyle !== "none") lines.push(renderBorder(widthArray, padding, [tl, tc, tr, h]));
+  if (borderStyle !== "none")
+    lines.push(renderBorder(widthArray, padding, [tl, tc, tr, h]));
 
   if (showHeaders) {
-    const headerCells = columns.map((col, i) => chalk.bold(truncateString(col.header, widthArray[i]).padEnd(widthArray[i])));
-    lines.push(`${v}${cellPadding}${headerCells.join(`${cellPadding}${v}${cellPadding}`)}${cellPadding}${v}`);
-    if (borderStyle !== "none") lines.push(renderBorder(widthArray, padding, [ml, mc, mr, h]));
+    const headerCells = columns.map((col, i) =>
+      chalk.bold(
+        truncateString(col.header, widthArray[i]).padEnd(widthArray[i]),
+      ),
+    );
+    lines.push(
+      `${v}${cellPadding}${headerCells.join(`${cellPadding}${v}${cellPadding}`)}${cellPadding}${v}`,
+    );
+    if (borderStyle !== "none")
+      lines.push(renderBorder(widthArray, padding, [ml, mc, mr, h]));
   }
 
   rows.forEach((row, rowIndex) => {
     const cells = columns.map((col, i) => {
       const width = widthArray[i];
-      const originalValue = col.formatter ? col.formatter(row[col.key]) : String(row[col.key] || "");
+      const originalValue = col.formatter
+        ? col.formatter(row[col.key])
+        : String(row[col.key] || "");
       if (stripAnsi(originalValue).length > width) {
         truncatedIndices.add(rowIndex);
       }
       const truncator = col.truncator || truncateString;
       const truncated = truncator(originalValue, width);
-      return truncated + " ".repeat(Math.max(0, width - stripAnsi(truncated).length));
+      return (
+        truncated + " ".repeat(Math.max(0, width - stripAnsi(truncated).length))
+      );
     });
-    lines.push(`${v}${cellPadding}${cells.join(`${cellPadding}${v}${cellPadding}`)}${cellPadding}${v}`);
+    lines.push(
+      `${v}${cellPadding}${cells.join(`${cellPadding}${v}${cellPadding}`)}${cellPadding}${v}`,
+    );
   });
 
-  if (borderStyle !== "none") lines.push(renderBorder(widthArray, padding, [bl, bc, br, h]));
+  if (borderStyle !== "none")
+    lines.push(renderBorder(widthArray, padding, [bl, bc, br, h]));
 
-  return { table: lines.join("\n"), truncatedIndices: Array.from(truncatedIndices) };
+  return {
+    table: lines.join("\n"),
+    truncatedIndices: Array.from(truncatedIndices),
+  };
 }
 
-export function renderVerticalTree(rows: any[], columns: TableColumn[]): string {
+export function renderVerticalTree(
+  rows: any[],
+  columns: TableColumn[],
+): string {
   const lines: string[] = [];
   rows.forEach((row, index) => {
     if (index > 0) lines.push("");
@@ -192,7 +231,9 @@ export function renderVerticalTree(rows: any[], columns: TableColumn[]): string 
     lines.push(chalk.cyan(`▶ ${name}`));
 
     columns.forEach((col) => {
-      const value = col.formatter ? col.formatter(row[col.key]) : String(row[col.key] || "");
+      const value = col.formatter
+        ? col.formatter(row[col.key])
+        : String(row[col.key] || "");
       lines.push(`  ├─ ${chalk.gray(`${col.header}:`)} ${value}`);
     });
   });
@@ -202,9 +243,13 @@ export function renderVerticalTree(rows: any[], columns: TableColumn[]): string 
 export function renderHybridTable(
   rows: any[],
   columns: TableColumn[],
-  options: TableOptions = {}
+  options: TableOptions = {},
 ): string {
-  const { table, truncatedIndices } = renderHorizontalTable(rows, columns, options);
+  const { table, truncatedIndices } = renderHorizontalTable(
+    rows,
+    columns,
+    options,
+  );
   const output = [table];
 
   if (truncatedIndices.length > 0) {
@@ -215,17 +260,39 @@ export function renderHybridTable(
   return output.join("\n");
 }
 
-export function renderProcessTable(processes: ProcessTableRow[], options?: TableOptions): string {
+export function renderProcessTable(
+  processes: ProcessTableRow[],
+  options?: TableOptions,
+): string {
   const columns: TableColumn[] = [
     { key: "id", header: "ID", formatter: (id) => chalk.blue(id) },
     { key: "pid", header: "PID", formatter: (pid) => chalk.yellow(pid) },
     { key: "name", header: "Name", formatter: (name) => chalk.cyan.bold(name) },
-    { key: "port", header: "Port", formatter: (port) => port === '-' ? chalk.gray(port) : chalk.hex('#FF6B6B')(port) },
-    { key: "memory", header: "Memory", formatter: (mem) => mem === '-' ? chalk.gray(mem) : chalk.hex('#4ECDC4')(mem) },
+    {
+      key: "port",
+      header: "Port",
+      formatter: (port) =>
+        port === "-" ? chalk.gray(port) : chalk.hex("#FF6B6B")(port),
+    },
+    {
+      key: "memory",
+      header: "Memory",
+      formatter: (mem) =>
+        mem === "-" ? chalk.gray(mem) : chalk.hex("#4ECDC4")(mem),
+    },
     { key: "command", header: "Command" },
-    { key: "workdir", header: "Directory", formatter: (dir) => chalk.gray(dir), truncator: truncatePath },
+    {
+      key: "workdir",
+      header: "Directory",
+      formatter: (dir) => chalk.gray(dir),
+      truncator: truncatePath,
+    },
     { key: "status", header: "Status" },
-    { key: "runtime", header: "Runtime", formatter: (runtime) => chalk.magenta(runtime) },
+    {
+      key: "runtime",
+      header: "Runtime",
+      formatter: (runtime) => chalk.magenta(runtime),
+    },
   ];
 
   return renderHybridTable(processes, columns, options);

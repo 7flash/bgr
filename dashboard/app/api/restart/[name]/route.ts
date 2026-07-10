@@ -1,28 +1,33 @@
 /**
  * POST /api/restart/:name — Force-restart a process
  */
-import { handleRun } from '../../../../lib/runtime';
-import { addHistoryEntry, getProcess } from '../../../../lib/runtime';
-import { measure } from 'measure-fn';
+import { handleRun } from "../../../../lib/runtime";
+import { addHistoryEntry, getProcess } from "../../../../lib/runtime";
+import { measure } from "measure-fn";
 
-export async function POST(req: Request, { params }: { params: { name: string } }) {
-    const name = decodeURIComponent(params.name);
-    const proc = getProcess(name);
-    const oldPid = proc?.pid;
+export async function POST(
+  req: Request,
+  { params }: { params: { name: string } },
+) {
+  const name = decodeURIComponent(params.name);
+  const proc = getProcess(name);
+  const oldPid = proc?.pid;
 
-    try {
-        await measure(`Restart "${name}"`, () => handleRun({
-            action: 'run',
-            name,
-            force: true,
-            remoteName: '',
-        }));
-        
-        // Record history
-        addHistoryEntry(name, 'restart', oldPid);
-        
-        return Response.json({ success: true });
-    } catch (e: any) {
-        return Response.json({ error: e.message }, { status: 500 });
-    }
+  try {
+    await measure(`Restart "${name}"`, () =>
+      handleRun({
+        action: "run",
+        name,
+        force: true,
+        remoteName: "",
+      }),
+    );
+
+    // Record history
+    addHistoryEntry(name, "restart", oldPid);
+
+    return Response.json({ success: true });
+  } catch (e: any) {
+    return Response.json({ error: e.message }, { status: 500 });
+  }
 }

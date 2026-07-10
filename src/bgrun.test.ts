@@ -6,1062 +6,1172 @@
  *
  * Run: bun test src/bgrun.test.ts
  */
-import { describe, expect, test } from 'bun:test'
-import { parseEnvString, parseCommandEnv, getDeclaredPort, calculateRuntime, buildManagedProcessEnv, getWatcherProcessName } from './utils'
-import { parseConfigFile, loadConfigEnv } from './config'
-import { buildDirectoryProcessName, generateAutoProcessName, joinCommandArgs } from './cli-helpers'
-import { stripAnsi, truncateString, truncatePath } from './table'
-import { detectPackageManager, formatDeployToolError } from './deploy'
-import { commandLineMatchesExpectedCommand, isProcessRunning, parseUnixListeningPorts, terminateProcess, waitForPortFree } from './platform'
-import { existsSync, mkdirSync, rmSync } from 'fs'
-import { pathToFileURL } from 'url'
+import { describe, expect, test } from "bun:test";
+import {
+  parseEnvString,
+  parseCommandEnv,
+  getDeclaredPort,
+  calculateRuntime,
+  buildManagedProcessEnv,
+  getWatcherProcessName,
+} from "./utils";
+import { parseConfigFile, loadConfigEnv } from "./config";
+import {
+  buildDirectoryProcessName,
+  generateAutoProcessName,
+  joinCommandArgs,
+} from "./cli-helpers";
+import { stripAnsi, truncateString, truncatePath } from "./table";
+import { detectPackageManager, formatDeployToolError } from "./deploy";
+import {
+  commandLineMatchesExpectedCommand,
+  isProcessRunning,
+  parseUnixListeningPorts,
+  terminateProcess,
+  waitForPortFree,
+} from "./platform";
+import { existsSync, mkdirSync, rmSync } from "fs";
+import { pathToFileURL } from "url";
 
 // Use a test-specific database to avoid polluting real data
-process.env.BGRUN_DB = `bgrun-test-${Date.now()}.sqlite`
-process.env.BGRUN_DISABLE_LEGACY_MIGRATION = '1'
+process.env.BGRUN_DB = `bgrun-test-${Date.now()}.sqlite`;
+process.env.BGRUN_DISABLE_LEGACY_MIGRATION = "1";
 
 async function rmDirWithRetries(dir: string, retries = 5) {
-    for (let i = 0; i < retries; i++) {
-        try {
-            rmSync(dir, { recursive: true, force: true })
-            return
-        } catch (err: any) {
-            if (err?.code !== 'EBUSY' || i === retries - 1) throw err
-            await Bun.sleep(300)
-        }
+  for (let i = 0; i < retries; i++) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (err: any) {
+      if (err?.code !== "EBUSY" || i === retries - 1) throw err;
+      await Bun.sleep(300);
     }
+  }
 }
 
 async function waitForCondition(
-    condition: () => boolean | Promise<boolean>,
-    timeoutMs = 8000,
-    intervalMs = 200,
+  condition: () => boolean | Promise<boolean>,
+  timeoutMs = 8000,
+  intervalMs = 200,
 ): Promise<boolean> {
-    const deadline = Date.now() + timeoutMs
-    while (Date.now() < deadline) {
-        if (await condition()) return true
-        await Bun.sleep(intervalMs)
-    }
-    return await condition()
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await condition()) return true;
+    await Bun.sleep(intervalMs);
+  }
+  return await condition();
 }
 
-const { handleRun, resolveInternalBgrunCommand } = await import('./commands/run')
-const { handleGuardToggle } = await import('./commands/guard')
-const { parseEnvitArgs, renderEnvitOutput } = await import('./commands/envit')
-const { parseInlineArgs } = await import('./commands/inline')
+const { handleRun, resolveInternalBgrunCommand } =
+  await import("./commands/run");
+const { handleGuardToggle } = await import("./commands/guard");
+const { parseEnvitArgs, renderEnvitOutput } = await import("./commands/envit");
+const { parseInlineArgs } = await import("./commands/inline");
 const {
-    getProcess,
-    removeProcessByName,
-    insertProcess,
-    addDependency,
-    removeDependency,
-    getDependencyGraph,
-    getDependencies,
-    getDependents,
-    getStartOrder,
-    removeAllDependencies,
-} = await import('./db')
+  getProcess,
+  removeProcessByName,
+  insertProcess,
+  addDependency,
+  removeDependency,
+  getDependencyGraph,
+  getDependencies,
+  getDependents,
+  getStartOrder,
+  removeAllDependencies,
+} = await import("./db");
 
 // ─── parseEnvString ─────────────────────────────────────
 
-describe('parseEnvString', () => {
-    test('parses comma-separated key=value pairs', () => {
-        const result = parseEnvString('PORT=3000,HOST=localhost,DEBUG=true')
-        expect(result).toEqual({
-            PORT: '3000',
-            HOST: 'localhost',
-            DEBUG: 'true',
-        })
-    })
+describe("parseEnvString", () => {
+  test("parses comma-separated key=value pairs", () => {
+    const result = parseEnvString("PORT=3000,HOST=localhost,DEBUG=true");
+    expect(result).toEqual({
+      PORT: "3000",
+      HOST: "localhost",
+      DEBUG: "true",
+    });
+  });
 
-    test('handles single pair', () => {
-        expect(parseEnvString('KEY=value')).toEqual({ KEY: 'value' })
-    })
+  test("handles single pair", () => {
+    expect(parseEnvString("KEY=value")).toEqual({ KEY: "value" });
+  });
 
-    test('handles empty string', () => {
-        expect(parseEnvString('')).toEqual({})
-    })
+  test("handles empty string", () => {
+    expect(parseEnvString("")).toEqual({});
+  });
 
-    test('ignores malformed pairs (no =)', () => {
-        const result = parseEnvString('GOOD=yes,BAD,ALSO_GOOD=ok')
-        expect(result.GOOD).toBe('yes')
-        expect(result.ALSO_GOOD).toBe('ok')
-        expect(result.BAD).toBeUndefined()
-    })
-})
+  test("ignores malformed pairs (no =)", () => {
+    const result = parseEnvString("GOOD=yes,BAD,ALSO_GOOD=ok");
+    expect(result.GOOD).toBe("yes");
+    expect(result.ALSO_GOOD).toBe("ok");
+    expect(result.BAD).toBeUndefined();
+  });
+});
 
-describe('parseCommandEnv / getDeclaredPort', () => {
-    test('parses Windows inline set prefixes', () => {
-        expect(parseCommandEnv('set BUN_PORT=3105&& set DEBUG=true && bun run server.ts')).toEqual({
-            BUN_PORT: '3105',
-            DEBUG: 'true',
-        })
-    })
+describe("parseCommandEnv / getDeclaredPort", () => {
+  test("parses Windows inline set prefixes", () => {
+    expect(
+      parseCommandEnv(
+        "set BUN_PORT=3105&& set DEBUG=true && bun run server.ts",
+      ),
+    ).toEqual({
+      BUN_PORT: "3105",
+      DEBUG: "true",
+    });
+  });
 
-    test('parses Unix-style env prefixes', () => {
-        expect(parseCommandEnv('PORT=4321 HOST=127.0.0.1 bun run server.ts')).toEqual({
-            PORT: '4321',
-            HOST: '127.0.0.1',
-        })
-    })
+  test("parses Unix-style env prefixes", () => {
+    expect(
+      parseCommandEnv("PORT=4321 HOST=127.0.0.1 bun run server.ts"),
+    ).toEqual({
+      PORT: "4321",
+      HOST: "127.0.0.1",
+    });
+  });
 
-    test('prefers explicit process env over inline command env for declared port', () => {
-        expect(getDeclaredPort({ PORT: '9999' }, 'set BUN_PORT=3105&& bun run server.ts')).toBe(9999)
-    })
+  test("prefers explicit process env over inline command env for declared port", () => {
+    expect(
+      getDeclaredPort(
+        { PORT: "9999" },
+        "set BUN_PORT=3105&& bun run server.ts",
+      ),
+    ).toBe(9999);
+  });
 
-    test('detects declared port from inline command env', () => {
-        expect(getDeclaredPort({}, 'set BUN_PORT=3105&& bun run server.ts')).toBe(3105)
-    })
-})
+  test("detects declared port from inline command env", () => {
+    expect(getDeclaredPort({}, "set BUN_PORT=3105&& bun run server.ts")).toBe(
+      3105,
+    );
+  });
+});
 
-describe('buildManagedProcessEnv', () => {
-    test('strips bgrun internal env leakage but preserves explicit process env', () => {
-        const env = buildManagedProcessEnv(
-            {
-                PATH: '/bin',
-                HOME: '/tmp/home',
-                BUN_PORT: '3000',
-                BGR_STDOUT: '/tmp/out.log',
-                BGR_STDERR: '/tmp/err.log',
-            },
-            {
-                PORT: '4310',
-                CUSTOM_FLAG: 'true',
-            },
-        )
+describe("buildManagedProcessEnv", () => {
+  test("strips bgrun internal env leakage but preserves explicit process env", () => {
+    const env = buildManagedProcessEnv(
+      {
+        PATH: "/bin",
+        HOME: "/tmp/home",
+        BUN_PORT: "3000",
+        BGR_STDOUT: "/tmp/out.log",
+        BGR_STDERR: "/tmp/err.log",
+      },
+      {
+        PORT: "4310",
+        CUSTOM_FLAG: "true",
+      },
+    );
 
-        expect(env.PATH).toBe(`${require('path').dirname(process.execPath)}${process.platform === 'win32' ? ';' : ':'}/bin`)
-        expect(env.HOME).toBe('/tmp/home')
-        expect(env.PORT).toBe('4310')
-        expect(env.CUSTOM_FLAG).toBe('true')
-        expect(env.BUN_PORT).toBeUndefined()
-        expect(env.BGR_STDOUT).toBeUndefined()
-        expect(env.BGR_STDERR).toBeUndefined()
-    })
+    expect(env.PATH).toBe(
+      `${require("path").dirname(process.execPath)}${process.platform === "win32" ? ";" : ":"}/bin`,
+    );
+    expect(env.HOME).toBe("/tmp/home");
+    expect(env.PORT).toBe("4310");
+    expect(env.CUSTOM_FLAG).toBe("true");
+    expect(env.BUN_PORT).toBeUndefined();
+    expect(env.BGR_STDOUT).toBeUndefined();
+    expect(env.BGR_STDERR).toBeUndefined();
+  });
 
-    test('prioritizes the real bun executable directory on PATH', () => {
-        const inheritedPath = [
-            'C:\\project\\node_modules\\.bin',
-            'C:\\Users\\galaxywin\\.bun\\bin',
-            'C:\\Windows\\System32',
-        ].join(process.platform === 'win32' ? ';' : ':')
+  test("prioritizes the real bun executable directory on PATH", () => {
+    const inheritedPath = [
+      "C:\\project\\node_modules\\.bin",
+      "C:\\Users\\galaxywin\\.bun\\bin",
+      "C:\\Windows\\System32",
+    ].join(process.platform === "win32" ? ";" : ":");
 
-        const env = buildManagedProcessEnv(
-            {
-                PATH: inheritedPath,
-            },
-            {},
-        )
+    const env = buildManagedProcessEnv(
+      {
+        PATH: inheritedPath,
+      },
+      {},
+    );
 
-        const parts = (env.PATH || '').split(process.platform === 'win32' ? ';' : ':')
-        expect(parts[0]).toBe(require('path').dirname(process.execPath))
-        expect(parts.filter(part => part === require('path').dirname(process.execPath)).length).toBe(1)
-        expect(parts).toContain('C:\\project\\node_modules\\.bin')
-    })
-})
+    const parts = (env.PATH || "").split(
+      process.platform === "win32" ? ";" : ":",
+    );
+    expect(parts[0]).toBe(require("path").dirname(process.execPath));
+    expect(
+      parts.filter((part) => part === require("path").dirname(process.execPath))
+        .length,
+    ).toBe(1);
+    expect(parts).toContain("C:\\project\\node_modules\\.bin");
+  });
+});
 
-describe('config env loading', () => {
-    test('loads and flattens nested config sections', async () => {
-        const dir = `${process.cwd()}/tmp-config-load-${Date.now()}`
-        mkdirSync(dir, { recursive: true })
+describe("config env loading", () => {
+  test("loads and flattens nested config sections", async () => {
+    const dir = `${process.cwd()}/tmp-config-load-${Date.now()}`;
+    mkdirSync(dir, { recursive: true });
 
-        try {
-            await Bun.write(`${dir}/.config.toml`, [
-                '[server]',
-                'port = 3000',
-                'host = "127.0.0.1"',
-                '',
-                '[wallets]',
-                '0 = "abc"',
-            ].join('\n'))
+    try {
+      await Bun.write(
+        `${dir}/.config.toml`,
+        [
+          "[server]",
+          "port = 3000",
+          'host = "127.0.0.1"',
+          "",
+          "[wallets]",
+          '0 = "abc"',
+        ].join("\n"),
+      );
 
-            const parsed = await parseConfigFile(`${dir}/.config.toml`)
-            expect(parsed).toEqual({
-                SERVER_PORT: '3000',
-                SERVER_HOST: '127.0.0.1',
-                WALLETS_0: 'abc',
-            })
+      const parsed = await parseConfigFile(`${dir}/.config.toml`);
+      expect(parsed).toEqual({
+        SERVER_PORT: "3000",
+        SERVER_HOST: "127.0.0.1",
+        WALLETS_0: "abc",
+      });
 
-            const loaded = await loadConfigEnv(dir)
-            expect(loaded.exists).toBe(true)
-            expect(loaded.configEnv.SERVER_PORT).toBe('3000')
-            expect(loaded.configEnv.SERVER_HOST).toBe('127.0.0.1')
-        } finally {
-            rmSync(dir, { recursive: true, force: true })
-        }
-    })
+      const loaded = await loadConfigEnv(dir);
+      expect(loaded.exists).toBe(true);
+      expect(loaded.configEnv.SERVER_PORT).toBe("3000");
+      expect(loaded.configEnv.SERVER_HOST).toBe("127.0.0.1");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
-    test('returns empty env when config file is missing', async () => {
-        const dir = `${process.cwd()}/tmp-config-missing-${Date.now()}`
-        mkdirSync(dir, { recursive: true })
+  test("returns empty env when config file is missing", async () => {
+    const dir = `${process.cwd()}/tmp-config-missing-${Date.now()}`;
+    mkdirSync(dir, { recursive: true });
 
-        try {
-            const loaded = await loadConfigEnv(dir)
-            expect(loaded.exists).toBe(false)
-            expect(loaded.configEnv).toEqual({})
-        } finally {
-            rmSync(dir, { recursive: true, force: true })
-        }
-    })
-})
+    try {
+      const loaded = await loadConfigEnv(dir);
+      expect(loaded.exists).toBe(false);
+      expect(loaded.configEnv).toEqual({});
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
-describe('parseEnvitArgs', () => {
-    test('parses positional config path', () => {
-        expect(parseEnvitArgs([
-            '.dev.toml',
-        ])).toEqual({
-            configPath: '.dev.toml',
-            directory: undefined,
-            shell: undefined,
-            help: false,
-        })
-    })
+describe("parseEnvitArgs", () => {
+  test("parses positional config path", () => {
+    expect(parseEnvitArgs([".dev.toml"])).toEqual({
+      configPath: ".dev.toml",
+      directory: undefined,
+      shell: undefined,
+      help: false,
+    });
+  });
 
-    test('parses explicit shell and directory options', () => {
-        expect(parseEnvitArgs([
-            '--directory=apps/api',
-            '--shell=json',
-            '--config', '.env.toml',
-        ])).toEqual({
-            directory: 'apps/api',
-            configPath: '.env.toml',
-            shell: 'json',
-            help: false,
-        })
-    })
-})
+  test("parses explicit shell and directory options", () => {
+    expect(
+      parseEnvitArgs([
+        "--directory=apps/api",
+        "--shell=json",
+        "--config",
+        ".env.toml",
+      ]),
+    ).toEqual({
+      directory: "apps/api",
+      configPath: ".env.toml",
+      shell: "json",
+      help: false,
+    });
+  });
+});
 
-describe('CLI --env mode', () => {
-    test('prints PowerShell export lines from config', async () => {
-        const dir = `${process.cwd()}/tmp-cli-env-${Date.now()}`
-        mkdirSync(dir, { recursive: true })
+describe("CLI --env mode", () => {
+  test("prints PowerShell export lines from config", async () => {
+    const dir = `${process.cwd()}/tmp-cli-env-${Date.now()}`;
+    mkdirSync(dir, { recursive: true });
 
-        try {
-            await Bun.write(`${dir}/.config.toml`, [
-                '[server]',
-                'port = 3000',
-                'name = "demo"',
-            ].join('\n'))
+    try {
+      await Bun.write(
+        `${dir}/.config.toml`,
+        ["[server]", "port = 3000", 'name = "demo"'].join("\n"),
+      );
 
-            const proc = Bun.spawn(
-                ['bun', 'run', 'src/index.ts', '--env', '--directory', dir],
-                {
-                    cwd: process.cwd(),
-                    stdout: 'pipe',
-                    stderr: 'pipe',
-                    env: Bun.env,
-                }
-            )
+      const proc = Bun.spawn(
+        ["bun", "run", "src/index.ts", "--env", "--directory", dir],
+        {
+          cwd: process.cwd(),
+          stdout: "pipe",
+          stderr: "pipe",
+          env: Bun.env,
+        },
+      );
 
-            const stdout = await new Response(proc.stdout).text()
-            const stderr = await new Response(proc.stderr).text()
-            const exitCode = await proc.exited
+      const stdout = await new Response(proc.stdout).text();
+      const stderr = await new Response(proc.stderr).text();
+      const exitCode = await proc.exited;
 
-            expect(exitCode).toBe(0)
-            expect(stderr).toBe('')
-            expect(stdout).toContain("$env:SERVER_PORT='3000'")
-            expect(stdout).toContain("$env:SERVER_NAME='demo'")
-        } finally {
-            rmSync(dir, { recursive: true, force: true })
-        }
-    })
-})
+      expect(exitCode).toBe(0);
+      expect(stderr).toBe("");
+      expect(stdout).toContain("$env:SERVER_PORT='3000'");
+      expect(stdout).toContain("$env:SERVER_NAME='demo'");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
-describe('parseInlineArgs', () => {
-    test('parses options before a -- command separator', () => {
-        expect(parseInlineArgs([
-            '--directory', 'apps/api',
-            '--config=.dev.toml',
-            '--',
-            'bun', 'run', 'dev', '--watch',
-        ])).toEqual({
-            directory: 'apps/api',
-            configPath: '.dev.toml',
-            commandArgs: ['bun', 'run', 'dev', '--watch'],
-            help: false,
-        })
-    })
-})
+describe("parseInlineArgs", () => {
+  test("parses options before a -- command separator", () => {
+    expect(
+      parseInlineArgs([
+        "--directory",
+        "apps/api",
+        "--config=.dev.toml",
+        "--",
+        "bun",
+        "run",
+        "dev",
+        "--watch",
+      ]),
+    ).toEqual({
+      directory: "apps/api",
+      configPath: ".dev.toml",
+      commandArgs: ["bun", "run", "dev", "--watch"],
+      help: false,
+    });
+  });
+});
 
-describe('renderEnvitOutput', () => {
-    test('renders PowerShell env assignments', () => {
-        expect(renderEnvitOutput({ SERVER_PORT: '3000', NAME: "o'hare" }, 'powershell')).toBe([
-            "$env:SERVER_PORT='3000'",
-            "$env:NAME='o''hare'",
-        ].join('\n'))
-    })
+describe("renderEnvitOutput", () => {
+  test("renders PowerShell env assignments", () => {
+    expect(
+      renderEnvitOutput({ SERVER_PORT: "3000", NAME: "o'hare" }, "powershell"),
+    ).toBe(["$env:SERVER_PORT='3000'", "$env:NAME='o''hare'"].join("\n"));
+  });
 
-    test('renders POSIX export statements', () => {
-        expect(renderEnvitOutput({ SERVER_PORT: '3000' }, 'sh')).toBe("export SERVER_PORT='3000'")
-    })
-})
+  test("renders POSIX export statements", () => {
+    expect(renderEnvitOutput({ SERVER_PORT: "3000" }, "sh")).toBe(
+      "export SERVER_PORT='3000'",
+    );
+  });
+});
 
-describe('cli helpers', () => {
-    test('builds process names from the working directory', () => {
-        expect(buildDirectoryProcessName('C:\\Code\\fairfun-landing')).toBe('fairfun-landing')
-        expect(buildDirectoryProcessName('C:\\Code\\My App')).toBe('my-app')
-    })
+describe("cli helpers", () => {
+  test("builds process names from the working directory", () => {
+    expect(buildDirectoryProcessName("C:\\Code\\fairfun-landing")).toBe(
+      "fairfun-landing",
+    );
+    expect(buildDirectoryProcessName("C:\\Code\\My App")).toBe("my-app");
+  });
 
-    test('adds numeric suffixes when a directory-based name already exists', () => {
-        const name = `auto-name-test-${Date.now()}`
-        insertProcess({
-            pid: 1,
-            workdir: `C:\\Code\\${name}`,
-            command: 'bun run server.ts',
-            name,
-            env: '',
-            configPath: '',
-            stdout_path: 'out.log',
-            stderr_path: 'err.log',
-        })
+  test("adds numeric suffixes when a directory-based name already exists", () => {
+    const name = `auto-name-test-${Date.now()}`;
+    insertProcess({
+      pid: 1,
+      workdir: `C:\\Code\\${name}`,
+      command: "bun run server.ts",
+      name,
+      env: "",
+      configPath: "",
+      stdout_path: "out.log",
+      stderr_path: "err.log",
+    });
 
-        try {
-            expect(generateAutoProcessName(`C:\\Code\\${name}`)).toBe(`${name}-1`)
-        } finally {
-            removeProcessByName(name)
-            removeProcessByName(`${name}-1`)
-        }
-    })
+    try {
+      expect(generateAutoProcessName(`C:\\Code\\${name}`)).toBe(`${name}-1`);
+    } finally {
+      removeProcessByName(name);
+      removeProcessByName(`${name}-1`);
+    }
+  });
 
-    test('quotes command args for shell reconstruction', () => {
-        expect(joinCommandArgs(['bun', 'run', 'my script.ts'])).toContain('my')
-        expect(joinCommandArgs(['bun', 'run', 'my script.ts'])).not.toBe('bun run my script.ts')
-    })
+  test("quotes command args for shell reconstruction", () => {
+    expect(joinCommandArgs(["bun", "run", "my script.ts"])).toContain("my");
+    expect(joinCommandArgs(["bun", "run", "my script.ts"])).not.toBe(
+      "bun run my script.ts",
+    );
+  });
 
-    test('does not quote a plain Windows absolute path argument', () => {
-        const command = joinCommandArgs(['bun', 'run', 'C:\\Code\\melina.js\\examples\\port-check\\server-implicit.ts'])
-        if (process.platform === 'win32') {
-            expect(command).toBe('bun run C:\\Code\\melina.js\\examples\\port-check\\server-implicit.ts')
-        } else {
-            expect(command).toContain('server-implicit.ts')
-        }
-    })
-})
+  test("does not quote a plain Windows absolute path argument", () => {
+    const command = joinCommandArgs([
+      "bun",
+      "run",
+      "C:\\Code\\melina.js\\examples\\port-check\\server-implicit.ts",
+    ]);
+    if (process.platform === "win32") {
+      expect(command).toBe(
+        "bun run C:\\Code\\melina.js\\examples\\port-check\\server-implicit.ts",
+      );
+    } else {
+      expect(command).toContain("server-implicit.ts");
+    }
+  });
+});
 
-describe('resolveInternalBgrunCommand', () => {
-    test('rewrites legacy internal dashboard command to bunx bgrun', () => {
-        const resolved = resolveInternalBgrunCommand('bgrun --_serve')
-        expect(resolved).toBe('bunx bgrun --_serve')
-        expect(resolved).toContain('--_serve')
-    })
+describe("resolveInternalBgrunCommand", () => {
+  test("rewrites legacy internal dashboard command to bunx bgrun", () => {
+    const resolved = resolveInternalBgrunCommand("bgrun --_serve");
+    expect(resolved).toBe("bunx bgrun --_serve");
+    expect(resolved).toContain("--_serve");
+  });
 
-    test('rewrites legacy internal watcher command to bunx bgrun', () => {
-        const resolved = resolveInternalBgrunCommand('bgrun --_watch-process "my-app"')
-        expect(resolved).toBe('bunx bgrun --_watch-process "my-app"')
-        expect(resolved).toContain('--_watch-process')
-        expect(resolved).toContain('my-app')
-    })
+  test("rewrites legacy internal watcher command to bunx bgrun", () => {
+    const resolved = resolveInternalBgrunCommand(
+      'bgrun --_watch-process "my-app"',
+    );
+    expect(resolved).toBe('bunx bgrun --_watch-process "my-app"');
+    expect(resolved).toContain("--_watch-process");
+    expect(resolved).toContain("my-app");
+  });
 
-    test('leaves bunx internal commands unchanged', () => {
-        expect(resolveInternalBgrunCommand('bunx bgrun --_serve')).toBe('bunx bgrun --_serve')
-    })
+  test("leaves bunx internal commands unchanged", () => {
+    expect(resolveInternalBgrunCommand("bunx bgrun --_serve")).toBe(
+      "bunx bgrun --_serve",
+    );
+  });
 
-    test('leaves normal commands unchanged', () => {
-        expect(resolveInternalBgrunCommand('bun run server.ts')).toBe('bun run server.ts')
-    })
-})
+  test("leaves normal commands unchanged", () => {
+    expect(resolveInternalBgrunCommand("bun run server.ts")).toBe(
+      "bun run server.ts",
+    );
+  });
+});
 
 // ─── calculateRuntime ───────────────────────────────────
 
-describe('calculateRuntime', () => {
-    test('returns 0 minutes for recent start', () => {
-        const now = new Date().toISOString()
-        expect(calculateRuntime(now)).toBe('0 minutes')
-    })
+describe("calculateRuntime", () => {
+  test("returns 0 minutes for recent start", () => {
+    const now = new Date().toISOString();
+    expect(calculateRuntime(now)).toBe("0 minutes");
+  });
 
-    test('returns correct minutes', () => {
-        const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString()
-        expect(calculateRuntime(fiveMinAgo)).toBe('5 minutes')
-    })
+  test("returns correct minutes", () => {
+    const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    expect(calculateRuntime(fiveMinAgo)).toBe("5 minutes");
+  });
 
-    test('returns correct for 1 hour', () => {
-        const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString()
-        expect(calculateRuntime(oneHourAgo)).toBe('60 minutes')
-    })
-})
+  test("returns correct for 1 hour", () => {
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    expect(calculateRuntime(oneHourAgo)).toBe("60 minutes");
+  });
+});
 
 // ─── stripAnsi ──────────────────────────────────────────
 
-describe('stripAnsi', () => {
-    test('strips color codes', () => {
-        const colored = '\u001b[31mred text\u001b[0m'
-        expect(stripAnsi(colored)).toBe('red text')
-    })
+describe("stripAnsi", () => {
+  test("strips color codes", () => {
+    const colored = "\u001b[31mred text\u001b[0m";
+    expect(stripAnsi(colored)).toBe("red text");
+  });
 
-    test('passes through plain text', () => {
-        expect(stripAnsi('hello world')).toBe('hello world')
-    })
+  test("passes through plain text", () => {
+    expect(stripAnsi("hello world")).toBe("hello world");
+  });
 
-    test('handles empty string', () => {
-        expect(stripAnsi('')).toBe('')
-    })
-})
+  test("handles empty string", () => {
+    expect(stripAnsi("")).toBe("");
+  });
+});
 
 // ─── truncateString ─────────────────────────────────────
 
-describe('truncateString', () => {
-    test('returns string unchanged if within limit', () => {
-        expect(truncateString('hello', 10)).toBe('hello')
-    })
+describe("truncateString", () => {
+  test("returns string unchanged if within limit", () => {
+    expect(truncateString("hello", 10)).toBe("hello");
+  });
 
-    test('truncates with ellipsis', () => {
-        const result = truncateString('a very long string that exceeds limit', 15)
-        expect(result.length).toBeLessThanOrEqual(15)
-        expect(result).toContain('…')
-    })
+  test("truncates with ellipsis", () => {
+    const result = truncateString("a very long string that exceeds limit", 15);
+    expect(result.length).toBeLessThanOrEqual(15);
+    expect(result).toContain("…");
+  });
 
-    test('handles maxLength smaller than ellipsis', () => {
-        const result = truncateString('hello world', 2)
-        expect(result.length).toBeLessThanOrEqual(2)
-    })
-})
+  test("handles maxLength smaller than ellipsis", () => {
+    const result = truncateString("hello world", 2);
+    expect(result.length).toBeLessThanOrEqual(2);
+  });
+});
 
 // ─── truncatePath ───────────────────────────────────────
 
-describe('truncatePath', () => {
-    test('returns path unchanged if within limit', () => {
-        expect(truncatePath('/home/user', 50)).toBe('/home/user')
-    })
+describe("truncatePath", () => {
+  test("returns path unchanged if within limit", () => {
+    expect(truncatePath("/home/user", 50)).toBe("/home/user");
+  });
 
-    test('truncates middle of long path', () => {
-        const longPath = '/home/user/projects/very/deeply/nested/directory/structure'
-        const result = truncatePath(longPath, 30)
-        expect(result.length).toBeLessThanOrEqual(30)
-        expect(result).toContain('…')
-    })
-})
+  test("truncates middle of long path", () => {
+    const longPath =
+      "/home/user/projects/very/deeply/nested/directory/structure";
+    const result = truncatePath(longPath, 30);
+    expect(result.length).toBeLessThanOrEqual(30);
+    expect(result).toContain("…");
+  });
+});
 
 // ─── detectPackageManager ───────────────────────────────
 
 // ─── isProcessRunning (Windows liveness fallback) ───────
 
-describe('isProcessRunning', () => {
-    test('returns true for the current process PID', async () => {
-        const alive = await isProcessRunning(process.pid)
-        expect(alive).toBe(true)
-    })
+describe("isProcessRunning", () => {
+  test("returns true for the current process PID", async () => {
+    const alive = await isProcessRunning(process.pid);
+    expect(alive).toBe(true);
+  });
 
-    test('returns false for PID 0 (intentionally stopped)', async () => {
-        const alive = await isProcessRunning(0)
-        expect(alive).toBe(false)
-    })
+  test("returns false for PID 0 (intentionally stopped)", async () => {
+    const alive = await isProcessRunning(0);
+    expect(alive).toBe(false);
+  });
 
-    test('returns false for a very high unlikely PID', async () => {
-        const alive = await isProcessRunning(999999)
-        expect(alive).toBe(false)
-    })
+  test("returns false for a very high unlikely PID", async () => {
+    const alive = await isProcessRunning(999999);
+    expect(alive).toBe(false);
+  });
 
-    test('returns false for negative PID', async () => {
-        const alive = await isProcessRunning(-1)
-        expect(alive).toBe(false)
-    })
+  test("returns false for negative PID", async () => {
+    const alive = await isProcessRunning(-1);
+    expect(alive).toBe(false);
+  });
 
-    test('returns false when PID exists but command does not match', async () => {
-        const alive = await isProcessRunning(process.pid, 'definitely-not-the-current-bgrun-test-command.ts')
-        expect(alive).toBe(false)
-    })
+  test("returns false when PID exists but command does not match", async () => {
+    const alive = await isProcessRunning(
+      process.pid,
+      "definitely-not-the-current-bgrun-test-command.ts",
+    );
+    expect(alive).toBe(false);
+  });
 
-    test('matches command lines using script/path tokens', () => {
-        expect(commandLineMatchesExpectedCommand(
-            'C:/Users/me/.bun/bin/bun.exe run C:/Code/app/src/server.ts',
-            'bun run ./src/server.ts',
-        )).toBe(true)
+  test("matches command lines using script/path tokens", () => {
+    expect(
+      commandLineMatchesExpectedCommand(
+        "C:/Users/me/.bun/bin/bun.exe run C:/Code/app/src/server.ts",
+        "bun run ./src/server.ts",
+      ),
+    ).toBe(true);
 
-        expect(commandLineMatchesExpectedCommand(
-            'C:/Users/me/.bun/bin/bun.exe run C:/Code/app/src/worker.ts',
-            'bun run ./src/server.ts',
-        )).toBe(false)
-    })
-})
+    expect(
+      commandLineMatchesExpectedCommand(
+        "C:/Users/me/.bun/bin/bun.exe run C:/Code/app/src/worker.ts",
+        "bun run ./src/server.ts",
+      ),
+    ).toBe(false);
+  });
+});
 
-describe('parseUnixListeningPorts', () => {
-    test('extracts only LISTEN ports from lsof output', () => {
-        const output = [
-            'COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME',
-            'bun     12345 root   21u  IPv4 123456      0t0  TCP *:3400 (LISTEN)',
-            'bun     12345 root   22u  IPv4 123457      0t0  TCP 127.0.0.1:9222 (LISTEN)',
-        ].join('\n')
+describe("parseUnixListeningPorts", () => {
+  test("extracts only LISTEN ports from lsof output", () => {
+    const output = [
+      "COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME",
+      "bun     12345 root   21u  IPv4 123456      0t0  TCP *:3400 (LISTEN)",
+      "bun     12345 root   22u  IPv4 123457      0t0  TCP 127.0.0.1:9222 (LISTEN)",
+    ].join("\n");
 
-        expect(parseUnixListeningPorts(output)).toEqual([3400, 9222])
-    })
+    expect(parseUnixListeningPorts(output)).toEqual([3400, 9222]);
+  });
 
-    test('ignores non-LISTEN sockets from broad lsof output', () => {
-        const output = [
-            'COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME',
-            'bun     12345 root   18u  IPv4 111111      0t0  TCP 127.0.0.1:49440->127.0.0.1:3000 (ESTABLISHED)',
-            'bun     12345 root   19u  IPv4 111112      0t0  TCP 127.0.0.1:49441->127.0.0.1:3737 (ESTABLISHED)',
-            'bun     12345 root   20u  IPv4 111113      0t0  TCP *:3400 (LISTEN)',
-        ].join('\n')
+  test("ignores non-LISTEN sockets from broad lsof output", () => {
+    const output = [
+      "COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME",
+      "bun     12345 root   18u  IPv4 111111      0t0  TCP 127.0.0.1:49440->127.0.0.1:3000 (ESTABLISHED)",
+      "bun     12345 root   19u  IPv4 111112      0t0  TCP 127.0.0.1:49441->127.0.0.1:3737 (ESTABLISHED)",
+      "bun     12345 root   20u  IPv4 111113      0t0  TCP *:3400 (LISTEN)",
+    ].join("\n");
 
-        expect(parseUnixListeningPorts(output)).toEqual([3400])
-    })
+    expect(parseUnixListeningPorts(output)).toEqual([3400]);
+  });
 
-    test('returns empty array for no-port worker output', () => {
-        const output = [
-            'COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME',
-            'bun     12345 root   18u  unix 0xffff      0t0      /tmp/bun.sock',
-            'bun     12345 root   19u  IPv4 111111      0t0  TCP 127.0.0.1:49440->127.0.0.1:3000 (ESTABLISHED)',
-        ].join('\n')
+  test("returns empty array for no-port worker output", () => {
+    const output = [
+      "COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME",
+      "bun     12345 root   18u  unix 0xffff      0t0      /tmp/bun.sock",
+      "bun     12345 root   19u  IPv4 111111      0t0  TCP 127.0.0.1:49440->127.0.0.1:3000 (ESTABLISHED)",
+    ].join("\n");
 
-        expect(parseUnixListeningPorts(output)).toEqual([])
-    })
-})
+    expect(parseUnixListeningPorts(output)).toEqual([]);
+  });
+});
 
-describe('handleRun port safety', () => {
-    test('does not auto-enable guard for new processes', async () => {
-        const dir = `${process.cwd()}/tmp-no-guard-default-${Date.now()}`
-        const scriptPath = `${dir}/worker.ts`
-        const name = `no-guard-default-${Date.now()}`
+describe("handleRun port safety", () => {
+  test("does not auto-enable guard for new processes", async () => {
+    const dir = `${process.cwd()}/tmp-no-guard-default-${Date.now()}`;
+    const scriptPath = `${dir}/worker.ts`;
+    const name = `no-guard-default-${Date.now()}`;
 
-        mkdirSync(dir, { recursive: true })
-        await Bun.write(scriptPath, 'setInterval(() => {}, 1000);\n')
+    mkdirSync(dir, { recursive: true });
+    await Bun.write(scriptPath, "setInterval(() => {}, 1000);\n");
 
+    try {
+      await handleRun({
+        action: "run",
+        name,
+        directory: dir,
+        command: `bun run ${scriptPath}`,
+        remoteName: "",
+      });
+
+      const proc = getProcess(name);
+      expect(proc).toBeDefined();
+      const env = proc?.env ?? "";
+      expect(env).not.toContain("BGR_KEEP_ALIVE=true");
+    } finally {
+      const proc = getProcess(name);
+      if (proc) {
         try {
-            await handleRun({
-                action: 'run',
-                name,
-                directory: dir,
-                command: `bun run ${scriptPath}`,
-                remoteName: '',
-            })
+          await terminateProcess(proc.pid, true);
+        } catch {}
+        removeProcessByName(name);
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15000);
 
-            const proc = getProcess(name)
-            expect(proc).toBeDefined()
-            const env = proc?.env ?? ''
-            expect(env).not.toContain('BGR_KEEP_ALIVE=true')
-        } finally {
-            const proc = getProcess(name)
-            if (proc) {
-                try {
-                    await terminateProcess(proc.pid, true)
-                } catch { }
-                removeProcessByName(name)
-            }
-            rmSync(dir, { recursive: true, force: true })
-        }
-    }, 15000)
+  test("does not refuse startup solely because PORT is set when the script ignores it", async () => {
+    const dir = `${process.cwd()}/tmp-port-guard-${Date.now()}`;
+    const scriptPath = `${dir}/ignore-port.ts`;
+    const name = `ignore-port-${Date.now()}`;
+    const probe = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch() {
+        return new Response("ok");
+      },
+    });
+    const port = probe.port;
+    probe.stop(true);
 
-    test('does not refuse startup solely because PORT is set when the script ignores it', async () => {
-        const dir = `${process.cwd()}/tmp-port-guard-${Date.now()}`
-        const scriptPath = `${dir}/ignore-port.ts`
-        const name = `ignore-port-${Date.now()}`
-        const probe = Bun.serve({
-            port: 0,
-            hostname: '127.0.0.1',
-            fetch() { return new Response('ok') },
-        })
-        const port = probe.port
-        probe.stop(true)
+    mkdirSync(dir, { recursive: true });
+    await Bun.write(scriptPath, ["setInterval(() => {}, 1000);"].join("\n"));
 
-        mkdirSync(dir, { recursive: true })
-        await Bun.write(scriptPath, [
-            'setInterval(() => {}, 1000);',
-        ].join('\n'))
+    try {
+      await handleRun({
+        action: "run",
+        name,
+        directory: dir,
+        command: `bun run ${scriptPath}`,
+        env: { PORT: String(port), BGR_KEEP_ALIVE: "false" },
+        remoteName: "",
+      });
 
+      const proc = getProcess(name);
+      expect(proc).toBeDefined();
+      expect(proc?.pid ?? 0).toBeGreaterThan(0);
+    } finally {
+      const proc = getProcess(name);
+      if (proc) {
         try {
-            await handleRun({
-                action: 'run',
-                name,
-                directory: dir,
-                command: `bun run ${scriptPath}`,
-                env: { PORT: String(port), BGR_KEEP_ALIVE: 'false' },
-                remoteName: '',
-            })
+          await terminateProcess(proc.pid, true);
+        } catch {}
+        removeProcessByName(name);
+      }
+      probe.stop(true);
+      await waitForPortFree(port, 5000);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15000);
 
-            const proc = getProcess(name)
-            expect(proc).toBeDefined()
-            expect(proc?.pid ?? 0).toBeGreaterThan(0)
-        } finally {
-            const proc = getProcess(name)
-            if (proc) {
-                try {
-                    await terminateProcess(proc.pid, true)
-                } catch { }
-                removeProcessByName(name)
-            }
-            probe.stop(true)
-            await waitForPortFree(port, 5000)
-            rmSync(dir, { recursive: true, force: true })
-        }
-    }, 15000)
+  test("still cleans up the old process ports on force restart", async () => {
+    const dir = `${process.cwd()}/tmp-port-guard-${Date.now()}`;
+    const scriptPath = `${dir}/serve-port.ts`;
+    const name = `port-guard-a-${Date.now()}`;
+    const probe = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch() {
+        return new Response("ok");
+      },
+    });
+    const port = probe.port;
+    probe.stop(true);
 
-    test('still cleans up the old process ports on force restart', async () => {
-        const dir = `${process.cwd()}/tmp-port-guard-${Date.now()}`
-        const scriptPath = `${dir}/serve-port.ts`
-        const name = `port-guard-a-${Date.now()}`
-        const probe = Bun.serve({
-            port: 0,
-            hostname: '127.0.0.1',
-            fetch() { return new Response('ok') },
-        })
-        const port = probe.port
-        probe.stop(true)
+    mkdirSync(dir, { recursive: true });
+    await Bun.write(
+      scriptPath,
+      [
+        "const port = Number(process.env.PORT);",
+        'Bun.serve({ port, hostname: "127.0.0.1", fetch() { return new Response("ok"); } });',
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+    );
 
-        mkdirSync(dir, { recursive: true })
-        await Bun.write(scriptPath, [
-            'const port = Number(process.env.PORT);',
-            'Bun.serve({ port, hostname: "127.0.0.1", fetch() { return new Response("ok"); } });',
-            'setInterval(() => {}, 1000);',
-        ].join('\n'))
+    try {
+      await handleRun({
+        action: "run",
+        name,
+        directory: dir,
+        command: `bun run ${scriptPath}`,
+        env: { PORT: String(port), BGR_KEEP_ALIVE: "false" },
+        remoteName: "",
+      });
 
+      await Bun.sleep(800);
+
+      await handleRun({
+        action: "run",
+        name,
+        directory: dir,
+        command: `bun run ${scriptPath}`,
+        env: { PORT: String(port), BGR_KEEP_ALIVE: "false" },
+        remoteName: "",
+        force: true,
+      });
+
+      const proc = getProcess(name);
+      expect(proc).toBeDefined();
+      expect(proc?.pid ?? 0).toBeGreaterThan(0);
+    } finally {
+      const proc = getProcess(name);
+      if (proc) {
         try {
-            await handleRun({
-                action: 'run',
-                name,
-                directory: dir,
-                command: `bun run ${scriptPath}`,
-                env: { PORT: String(port), BGR_KEEP_ALIVE: 'false' },
-                remoteName: '',
-            })
+          await terminateProcess(proc.pid, true);
+        } catch {}
+        removeProcessByName(name);
+      }
+      await waitForPortFree(port, 5000);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20000);
+});
 
-            await Bun.sleep(800)
+describe("handleRun startup health regression", () => {
+  test("does not register a process that exits during startup", async () => {
+    const dir = `${process.cwd()}/tmp-startup-failure-${Date.now()}`;
+    const scriptPath = `${dir}/exits-immediately.ts`;
+    const name = `startup-failure-${Date.now()}`;
 
-            await handleRun({
-                action: 'run',
-                name,
-                directory: dir,
-                command: `bun run ${scriptPath}`,
-                env: { PORT: String(port), BGR_KEEP_ALIVE: 'false' },
-                remoteName: '',
-                force: true,
-            })
+    mkdirSync(dir, { recursive: true });
+    await Bun.write(
+      scriptPath,
+      [
+        'console.error("startup exploded before listen");',
+        "process.exit(42);",
+      ].join("\n"),
+    );
 
-            const proc = getProcess(name)
-            expect(proc).toBeDefined()
-            expect(proc?.pid ?? 0).toBeGreaterThan(0)
-        } finally {
-            const proc = getProcess(name)
-            if (proc) {
-                try {
-                    await terminateProcess(proc.pid, true)
-                } catch { }
-                removeProcessByName(name)
-            }
-            await waitForPortFree(port, 5000)
-            rmSync(dir, { recursive: true, force: true })
-        }
-    }, 20000)
-})
+    try {
+      let failure: Error | null = null;
+      try {
+        await handleRun({
+          action: "run",
+          name,
+          directory: dir,
+          command: joinCommandArgs(["bun", "run", scriptPath]),
+          remoteName: "",
+        });
+      } catch (error: any) {
+        failure = error;
+      }
 
-describe('handleRun startup health regression', () => {
-    test('does not register a process that exits during startup', async () => {
-        const dir = `${process.cwd()}/tmp-startup-failure-${Date.now()}`
-        const scriptPath = `${dir}/exits-immediately.ts`
-        const name = `startup-failure-${Date.now()}`
-
-        mkdirSync(dir, { recursive: true })
-        await Bun.write(scriptPath, [
-            'console.error("startup exploded before listen");',
-            'process.exit(42);',
-        ].join('\n'))
-
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure?.message).toContain("failed to stay running");
+      expect(failure?.message).toContain("startup exploded before listen");
+      expect(getProcess(name)).toBeNull();
+    } finally {
+      const proc = getProcess(name);
+      if (proc) {
         try {
-            let failure: Error | null = null
-            try {
-                await handleRun({
-                    action: 'run',
-                    name,
-                    directory: dir,
-                    command: joinCommandArgs(['bun', 'run', scriptPath]),
-                    remoteName: '',
-                })
-            } catch (error: any) {
-                failure = error
-            }
+          await terminateProcess(proc.pid, true);
+        } catch {}
+        removeProcessByName(name);
+      }
+      await rmDirWithRetries(dir);
+    }
+  }, 20000);
+});
 
-            expect(failure).toBeInstanceOf(Error)
-            expect(failure?.message).toContain('failed to stay running')
-            expect(failure?.message).toContain('startup exploded before listen')
-            expect(getProcess(name)).toBeNull()
-        } finally {
-            const proc = getProcess(name)
-            if (proc) {
-                try {
-                    await terminateProcess(proc.pid, true)
-                } catch { }
-                removeProcessByName(name)
-            }
-            await rmDirWithRetries(dir)
+describe("SDK child process stop tree", () => {
+  test("bgrun --stop parent stops children spawned by the parent through the SDK", async () => {
+    const dir = `${process.cwd()}/tmp-sdk-stop-tree-${Date.now()}`;
+    const parentName = `sdk-parent-${Date.now()}`;
+    const childAName = `${parentName}-child-a`;
+    const childBName = `${parentName}-child-b`;
+    const childScript = `${dir}/sdk-child-worker.ts`;
+    const parentScript = `${dir}/sdk-parent.ts`;
+    const readyPath = `${dir}/children-ready.txt`;
+    const apiImportPath = pathToFileURL(`${process.cwd()}/src/api.ts`).href;
+
+    mkdirSync(dir, { recursive: true });
+    await Bun.write(
+      childScript,
+      [
+        'const childName = process.argv[2] || process.env.BGR_PROCESS_NAME || "child";',
+        'console.log(`child ${childName} started with parent=${process.env.BGR_PARENT_NAME || ""}`);',
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+    );
+
+    const childSpecs = [
+      {
+        name: childAName,
+        command: joinCommandArgs(["bun", "run", childScript, childAName]),
+      },
+      {
+        name: childBName,
+        command: joinCommandArgs(["bun", "run", childScript, childBName]),
+      },
+    ];
+
+    await Bun.write(
+      parentScript,
+      [
+        `import bgrun from ${JSON.stringify(apiImportPath)};`,
+        `const childSpecs = ${JSON.stringify(childSpecs)};`,
+        `const directory = ${JSON.stringify(dir)};`,
+        `const readyPath = ${JSON.stringify(readyPath)};`,
+        "for (const child of childSpecs) {",
+        "  await bgrun.handleRun({",
+        '    action: "run",',
+        "    name: child.name,",
+        "    directory,",
+        "    command: child.command,",
+        '    env: { BGR_KEEP_ALIVE: "false" },',
+        '    remoteName: "",',
+        "  });",
+        "}",
+        'await Bun.write(readyPath, "ready");',
+        'console.log("sdk parent started children");',
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+    );
+
+    try {
+      await handleRun({
+        action: "run",
+        name: parentName,
+        directory: dir,
+        command: joinCommandArgs(["bun", "run", parentScript]),
+        remoteName: "",
+      });
+
+      const childrenReady = await waitForCondition(() => {
+        return (
+          existsSync(readyPath) &&
+          !!getProcess(childAName) &&
+          !!getProcess(childBName)
+        );
+      }, 15000);
+      expect(childrenReady).toBe(true);
+
+      const childAProc = getProcess(childAName);
+      const childBProc = getProcess(childBName);
+      expect(childAProc).toBeDefined();
+      expect(childBProc).toBeDefined();
+      expect(parseEnvString(childAProc?.env || "").BGR_PARENT_NAME).toBe(
+        parentName,
+      );
+      expect(parseEnvString(childBProc?.env || "").BGR_PARENT_NAME).toBe(
+        parentName,
+      );
+      expect(await isProcessRunning(childAProc!.pid, childAProc!.command)).toBe(
+        true,
+      );
+      expect(await isProcessRunning(childBProc!.pid, childBProc!.command)).toBe(
+        true,
+      );
+
+      const stopProc = Bun.spawn(
+        ["bun", "run", "src/index.ts", "--stop", parentName],
+        {
+          cwd: process.cwd(),
+          stdout: "pipe",
+          stderr: "pipe",
+          env: {
+            ...Bun.env,
+            BGRUN_DB: process.env.BGRUN_DB!,
+            BGRUN_DISABLE_LEGACY_MIGRATION: "1",
+          },
+        },
+      );
+      const stopStdout = await new Response(stopProc.stdout).text();
+      const stopStderr = await new Response(stopProc.stderr).text();
+      const stopExitCode = await stopProc.exited;
+
+      expect(stopExitCode).toBe(0);
+      expect(stopStderr).toBe("");
+      expect(stopStdout).toContain(parentName);
+
+      const stopped = await waitForCondition(async () => {
+        const parent = getProcess(parentName);
+        const childA = getProcess(childAName);
+        const childB = getProcess(childBName);
+        if (!parent || !childA || !childB) return false;
+
+        return (
+          parent.pid === 0 &&
+          childA.pid === 0 &&
+          childB.pid === 0 &&
+          !(await isProcessRunning(parent.pid, parent.command)) &&
+          !(await isProcessRunning(childA.pid, childA.command)) &&
+          !(await isProcessRunning(childB.pid, childB.command))
+        );
+      }, 12000);
+
+      expect(stopped).toBe(true);
+    } finally {
+      for (const processName of [childAName, childBName, parentName]) {
+        const proc = getProcess(processName);
+        if (proc) {
+          try {
+            await terminateProcess(proc.pid, true);
+          } catch {}
+          removeProcessByName(processName);
         }
-    }, 20000)
-})
+      }
+      await rmDirWithRetries(dir);
+    }
+  }, 40000);
+});
 
+describe("CLI implicit command mode", () => {
+  test("treats multi-positional args as a managed command without requiring literal --", async () => {
+    const dir = `${process.cwd()}/tmp-cli-implicit-${Date.now()}`;
+    const scriptPath = `${dir}/worker.ts`;
 
+    mkdirSync(dir, { recursive: true });
+    await Bun.write(scriptPath, "setInterval(() => {}, 1000);\n");
 
-describe('SDK child process stop tree', () => {
-    test('bgrun --stop parent stops children spawned by the parent through the SDK', async () => {
-        const dir = `${process.cwd()}/tmp-sdk-stop-tree-${Date.now()}`
-        const parentName = `sdk-parent-${Date.now()}`
-        const childAName = `${parentName}-child-a`
-        const childBName = `${parentName}-child-b`
-        const childScript = `${dir}/sdk-child-worker.ts`
-        const parentScript = `${dir}/sdk-parent.ts`
-        const readyPath = `${dir}/children-ready.txt`
-        const apiImportPath = pathToFileURL(`${process.cwd()}/src/api.ts`).href
+    let launchedName = "";
 
-        mkdirSync(dir, { recursive: true })
-        await Bun.write(childScript, [
-            'const childName = process.argv[2] || process.env.BGR_PROCESS_NAME || "child";',
-            'console.log(`child ${childName} started with parent=${process.env.BGR_PARENT_NAME || ""}`);',
-            'setInterval(() => {}, 1000);',
-        ].join('\n'))
+    try {
+      const proc = Bun.spawn(
+        [
+          "bun",
+          "run",
+          "src/index.ts",
+          "--directory",
+          dir,
+          "bun",
+          "run",
+          scriptPath,
+        ],
+        {
+          cwd: process.cwd(),
+          stdout: "pipe",
+          stderr: "pipe",
+          env: {
+            ...Bun.env,
+            BGRUN_DB: process.env.BGRUN_DB!,
+            BGRUN_DISABLE_LEGACY_MIGRATION: "1",
+          },
+        },
+      );
 
-        const childSpecs = [
-            {
-                name: childAName,
-                command: joinCommandArgs(['bun', 'run', childScript, childAName]),
-            },
-            {
-                name: childBName,
-                command: joinCommandArgs(['bun', 'run', childScript, childBName]),
-            },
-        ]
+      const stdout = await new Response(proc.stdout).text();
+      const stderr = await new Response(proc.stderr).text();
+      const exitCode = await proc.exited;
 
-        await Bun.write(parentScript, [
-            `import bgrun from ${JSON.stringify(apiImportPath)};`,
-            `const childSpecs = ${JSON.stringify(childSpecs)};`,
-            `const directory = ${JSON.stringify(dir)};`,
-            `const readyPath = ${JSON.stringify(readyPath)};`,
-            'for (const child of childSpecs) {',
-            '  await bgrun.handleRun({',
-            '    action: "run",',
-            '    name: child.name,',
-            '    directory,',
-            '    command: child.command,',
-            '    env: { BGR_KEEP_ALIVE: "false" },',
-            '    remoteName: "",',
-            '  });',
-            '}',
-            'await Bun.write(readyPath, "ready");',
-            'console.log("sdk parent started children");',
-            'setInterval(() => {}, 1000);',
-        ].join('\n'))
+      expect(exitCode).toBe(0);
+      expect(stderr).toBe("");
+      expect(stdout).toContain('Launched process "');
 
+      const match = stdout.match(/Launched process "([^"]+)"/);
+      expect(match).not.toBeNull();
+      launchedName = match?.[1] || "";
+      expect(launchedName.length).toBeGreaterThan(0);
+    } finally {
+      if (launchedName) {
+        const proc = getProcess(launchedName);
+        if (proc) {
+          try {
+            await terminateProcess(proc.pid, true);
+          } catch {}
+          removeProcessByName(launchedName);
+        }
+      }
+      await rmDirWithRetries(dir);
+    }
+  }, 20000);
+});
+
+describe("guard CLI toggles", () => {
+  test("enables and disables the per-process watcher", async () => {
+    const dir = `${process.cwd()}/tmp-guard-toggle-${Date.now()}`;
+    const scriptPath = `${dir}/worker.ts`;
+    const name = `guard-toggle-${Date.now()}`;
+    const watcherName = getWatcherProcessName(name);
+
+    mkdirSync(dir, { recursive: true });
+    await Bun.write(scriptPath, "setInterval(() => {}, 1000);\n");
+
+    try {
+      await handleRun({
+        action: "run",
+        name,
+        directory: dir,
+        command: `bun run ${scriptPath}`,
+        remoteName: "",
+      });
+
+      let proc = getProcess(name);
+      expect(proc).toBeDefined();
+      expect(proc?.env ?? "").not.toContain("BGR_KEEP_ALIVE=true");
+
+      await handleGuardToggle(name, true);
+
+      await Bun.sleep(1200);
+
+      proc = getProcess(name);
+      expect(proc).toBeDefined();
+      expect(proc?.env ?? "").toContain("BGR_KEEP_ALIVE=true");
+      expect(getProcess(watcherName)).toBeDefined();
+
+      await handleGuardToggle(name, false);
+
+      await Bun.sleep(600);
+
+      proc = getProcess(name);
+      expect(proc).toBeDefined();
+      expect(proc?.env ?? "").not.toContain("BGR_KEEP_ALIVE=true");
+      expect(getProcess(watcherName)).toBeNull();
+    } finally {
+      const watcherProc = getProcess(watcherName);
+      if (watcherProc) {
         try {
-            await handleRun({
-                action: 'run',
-                name: parentName,
-                directory: dir,
-                command: joinCommandArgs(['bun', 'run', parentScript]),
-                remoteName: '',
-            })
+          await terminateProcess(watcherProc.pid, true);
+        } catch {}
+        removeProcessByName(watcherName);
+      }
 
-            const childrenReady = await waitForCondition(() => {
-                return existsSync(readyPath) && !!getProcess(childAName) && !!getProcess(childBName)
-            }, 15000)
-            expect(childrenReady).toBe(true)
-
-            const childAProc = getProcess(childAName)
-            const childBProc = getProcess(childBName)
-            expect(childAProc).toBeDefined()
-            expect(childBProc).toBeDefined()
-            expect(parseEnvString(childAProc?.env || '').BGR_PARENT_NAME).toBe(parentName)
-            expect(parseEnvString(childBProc?.env || '').BGR_PARENT_NAME).toBe(parentName)
-            expect(await isProcessRunning(childAProc!.pid, childAProc!.command)).toBe(true)
-            expect(await isProcessRunning(childBProc!.pid, childBProc!.command)).toBe(true)
-
-            const stopProc = Bun.spawn(
-                ['bun', 'run', 'src/index.ts', '--stop', parentName],
-                {
-                    cwd: process.cwd(),
-                    stdout: 'pipe',
-                    stderr: 'pipe',
-                    env: {
-                        ...Bun.env,
-                        BGRUN_DB: process.env.BGRUN_DB!,
-                        BGRUN_DISABLE_LEGACY_MIGRATION: '1',
-                    },
-                },
-            )
-            const stopStdout = await new Response(stopProc.stdout).text()
-            const stopStderr = await new Response(stopProc.stderr).text()
-            const stopExitCode = await stopProc.exited
-
-            expect(stopExitCode).toBe(0)
-            expect(stopStderr).toBe('')
-            expect(stopStdout).toContain(parentName)
-
-            const stopped = await waitForCondition(async () => {
-                const parent = getProcess(parentName)
-                const childA = getProcess(childAName)
-                const childB = getProcess(childBName)
-                if (!parent || !childA || !childB) return false
-
-                return (
-                    parent.pid === 0 &&
-                    childA.pid === 0 &&
-                    childB.pid === 0 &&
-                    !(await isProcessRunning(parent.pid, parent.command)) &&
-                    !(await isProcessRunning(childA.pid, childA.command)) &&
-                    !(await isProcessRunning(childB.pid, childB.command))
-                )
-            }, 12000)
-
-            expect(stopped).toBe(true)
-        } finally {
-            for (const processName of [childAName, childBName, parentName]) {
-                const proc = getProcess(processName)
-                if (proc) {
-                    try {
-                        await terminateProcess(proc.pid, true)
-                    } catch { }
-                    removeProcessByName(processName)
-                }
-            }
-            await rmDirWithRetries(dir)
-        }
-    }, 40000)
-})
-
-
-describe('CLI implicit command mode', () => {
-    test('treats multi-positional args as a managed command without requiring literal --', async () => {
-        const dir = `${process.cwd()}/tmp-cli-implicit-${Date.now()}`
-        const scriptPath = `${dir}/worker.ts`
-
-        mkdirSync(dir, { recursive: true })
-        await Bun.write(scriptPath, 'setInterval(() => {}, 1000);\n')
-
-        let launchedName = ''
-
+      const proc = getProcess(name);
+      if (proc) {
         try {
-            const proc = Bun.spawn(
-                ['bun', 'run', 'src/index.ts', '--directory', dir, 'bun', 'run', scriptPath],
-                {
-                    cwd: process.cwd(),
-                    stdout: 'pipe',
-                    stderr: 'pipe',
-                    env: {
-                        ...Bun.env,
-                        BGRUN_DB: process.env.BGRUN_DB!,
-                        BGRUN_DISABLE_LEGACY_MIGRATION: '1',
-                    },
-                }
-            )
+          await terminateProcess(proc.pid, true);
+        } catch {}
+        removeProcessByName(name);
+      }
 
-            const stdout = await new Response(proc.stdout).text()
-            const stderr = await new Response(proc.stderr).text()
-            const exitCode = await proc.exited
-
-            expect(exitCode).toBe(0)
-            expect(stderr).toBe('')
-            expect(stdout).toContain('Launched process "')
-
-            const match = stdout.match(/Launched process "([^"]+)"/)
-            expect(match).not.toBeNull()
-            launchedName = match?.[1] || ''
-            expect(launchedName.length).toBeGreaterThan(0)
-        } finally {
-            if (launchedName) {
-                const proc = getProcess(launchedName)
-                if (proc) {
-                    try {
-                        await terminateProcess(proc.pid, true)
-                    } catch { }
-                    removeProcessByName(launchedName)
-                }
-            }
-            await rmDirWithRetries(dir)
-        }
-    }, 20000)
-})
-
-describe('guard CLI toggles', () => {
-    test('enables and disables the per-process watcher', async () => {
-        const dir = `${process.cwd()}/tmp-guard-toggle-${Date.now()}`
-        const scriptPath = `${dir}/worker.ts`
-        const name = `guard-toggle-${Date.now()}`
-        const watcherName = getWatcherProcessName(name)
-
-        mkdirSync(dir, { recursive: true })
-        await Bun.write(scriptPath, 'setInterval(() => {}, 1000);\n')
-
-        try {
-            await handleRun({
-                action: 'run',
-                name,
-                directory: dir,
-                command: `bun run ${scriptPath}`,
-                remoteName: '',
-            })
-
-            let proc = getProcess(name)
-            expect(proc).toBeDefined()
-            expect(proc?.env ?? '').not.toContain('BGR_KEEP_ALIVE=true')
-
-            await handleGuardToggle(name, true)
-
-            await Bun.sleep(1200)
-
-            proc = getProcess(name)
-            expect(proc).toBeDefined()
-            expect(proc?.env ?? '').toContain('BGR_KEEP_ALIVE=true')
-            expect(getProcess(watcherName)).toBeDefined()
-
-            await handleGuardToggle(name, false)
-
-            await Bun.sleep(600)
-
-            proc = getProcess(name)
-            expect(proc).toBeDefined()
-            expect(proc?.env ?? '').not.toContain('BGR_KEEP_ALIVE=true')
-            expect(getProcess(watcherName)).toBeNull()
-        } finally {
-            const watcherProc = getProcess(watcherName)
-            if (watcherProc) {
-                try {
-                    await terminateProcess(watcherProc.pid, true)
-                } catch { }
-                removeProcessByName(watcherName)
-            }
-
-            const proc = getProcess(name)
-            if (proc) {
-                try {
-                    await terminateProcess(proc.pid, true)
-                } catch { }
-                removeProcessByName(name)
-            }
-
-            await rmDirWithRetries(dir)
-        }
-    }, 25000)
-})
+      await rmDirWithRetries(dir);
+    }
+  }, 25000);
+});
 
 // ─── detectPackageManager ───────────────────────────────
 
-describe('formatDeployToolError', () => {
-    test('returns actionable message for missing binary', () => {
-        const msg = formatDeployToolError('pnpm', new Error('command not found: pnpm'))
-        expect(msg).toContain("requires 'pnpm'")
-        expect(msg).toContain('PATH')
-    })
+describe("formatDeployToolError", () => {
+  test("returns actionable message for missing binary", () => {
+    const msg = formatDeployToolError(
+      "pnpm",
+      new Error("command not found: pnpm"),
+    );
+    expect(msg).toContain("requires 'pnpm'");
+    expect(msg).toContain("PATH");
+  });
 
-    test('preserves non-missing-binary failures', () => {
-        const msg = formatDeployToolError('npm', new Error('npm ci failed with exit code 1'))
-        expect(msg).toContain('Dependency install failed with npm')
-        expect(msg).toContain('exit code 1')
-    })
-})
+  test("preserves non-missing-binary failures", () => {
+    const msg = formatDeployToolError(
+      "npm",
+      new Error("npm ci failed with exit code 1"),
+    );
+    expect(msg).toContain("Dependency install failed with npm");
+    expect(msg).toContain("exit code 1");
+  });
+});
 
-describe('detectPackageManager', () => {
-    test('returns null when no package.json exists', async () => {
-        const dir = `${process.cwd()}/tmp-no-package-${Date.now()}`
-        mkdirSync(dir, { recursive: true })
-        try {
-            expect(await detectPackageManager(dir)).toBeNull()
-        } finally {
-            rmSync(dir, { recursive: true, force: true })
-        }
-    })
+describe("detectPackageManager", () => {
+  test("returns null when no package.json exists", async () => {
+    const dir = `${process.cwd()}/tmp-no-package-${Date.now()}`;
+    mkdirSync(dir, { recursive: true });
+    try {
+      expect(await detectPackageManager(dir)).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
-    test('prefers bun lockfiles', async () => {
-        const dir = `${process.cwd()}/tmp-bun-${Date.now()}`
-        mkdirSync(dir, { recursive: true })
-        try {
-            await Bun.write(`${dir}/package.json`, '{}')
-            await Bun.write(`${dir}/bun.lock`, '')
-            expect(await detectPackageManager(dir)).toBe('bun')
-        } finally {
-            rmSync(dir, { recursive: true, force: true })
-        }
-    })
+  test("prefers bun lockfiles", async () => {
+    const dir = `${process.cwd()}/tmp-bun-${Date.now()}`;
+    mkdirSync(dir, { recursive: true });
+    try {
+      await Bun.write(`${dir}/package.json`, "{}");
+      await Bun.write(`${dir}/bun.lock`, "");
+      expect(await detectPackageManager(dir)).toBe("bun");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
-    test('detects pnpm, yarn, and npm lockfiles', async () => {
-        const base = `${process.cwd()}/tmp-pm-${Date.now()}`
+  test("detects pnpm, yarn, and npm lockfiles", async () => {
+    const base = `${process.cwd()}/tmp-pm-${Date.now()}`;
 
-        const pnpmDir = `${base}-pnpm`
-        mkdirSync(pnpmDir, { recursive: true })
-        await Bun.write(`${pnpmDir}/package.json`, '{}')
-        await Bun.write(`${pnpmDir}/pnpm-lock.yaml`, '')
-        expect(await detectPackageManager(pnpmDir)).toBe('pnpm')
+    const pnpmDir = `${base}-pnpm`;
+    mkdirSync(pnpmDir, { recursive: true });
+    await Bun.write(`${pnpmDir}/package.json`, "{}");
+    await Bun.write(`${pnpmDir}/pnpm-lock.yaml`, "");
+    expect(await detectPackageManager(pnpmDir)).toBe("pnpm");
 
-        const yarnDir = `${base}-yarn`
-        mkdirSync(yarnDir, { recursive: true })
-        await Bun.write(`${yarnDir}/package.json`, '{}')
-        await Bun.write(`${yarnDir}/yarn.lock`, '')
-        expect(await detectPackageManager(yarnDir)).toBe('yarn')
+    const yarnDir = `${base}-yarn`;
+    mkdirSync(yarnDir, { recursive: true });
+    await Bun.write(`${yarnDir}/package.json`, "{}");
+    await Bun.write(`${yarnDir}/yarn.lock`, "");
+    expect(await detectPackageManager(yarnDir)).toBe("yarn");
 
-        const npmDir = `${base}-npm`
-        mkdirSync(npmDir, { recursive: true })
-        await Bun.write(`${npmDir}/package.json`, '{}')
-        await Bun.write(`${npmDir}/package-lock.json`, '{}')
-        expect(await detectPackageManager(npmDir)).toBe('npm')
+    const npmDir = `${base}-npm`;
+    mkdirSync(npmDir, { recursive: true });
+    await Bun.write(`${npmDir}/package.json`, "{}");
+    await Bun.write(`${npmDir}/package-lock.json`, "{}");
+    expect(await detectPackageManager(npmDir)).toBe("npm");
 
-        rmSync(pnpmDir, { recursive: true, force: true })
-        rmSync(yarnDir, { recursive: true, force: true })
-        rmSync(npmDir, { recursive: true, force: true })
-    })
+    rmSync(pnpmDir, { recursive: true, force: true });
+    rmSync(yarnDir, { recursive: true, force: true });
+    rmSync(npmDir, { recursive: true, force: true });
+  });
 
-    test('defaults to bun for package.json projects without a lockfile', async () => {
-        const dir = `${process.cwd()}/tmp-default-bun-${Date.now()}`
-        mkdirSync(dir, { recursive: true })
-        try {
-            await Bun.write(`${dir}/package.json`, '{}')
-            expect(await detectPackageManager(dir)).toBe('bun')
-        } finally {
-            rmSync(dir, { recursive: true, force: true })
-        }
-    })
-})
+  test("defaults to bun for package.json projects without a lockfile", async () => {
+    const dir = `${process.cwd()}/tmp-default-bun-${Date.now()}`;
+    mkdirSync(dir, { recursive: true });
+    try {
+      await Bun.write(`${dir}/package.json`, "{}");
+      expect(await detectPackageManager(dir)).toBe("bun");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 // ─── Dependencies ───────────────────────────────────────
 
-describe('addDependency', () => {
-    test('adds a valid dependency', () => {
-        removeAllDependencies('web-server');
-        removeAllDependencies('database');
-        const ok = addDependency('web-server', 'database');
-        expect(ok).toBe(true);
-        expect(getDependencies('web-server')).toContain('database');
-    })
+describe("addDependency", () => {
+  test("adds a valid dependency", () => {
+    removeAllDependencies("web-server");
+    removeAllDependencies("database");
+    const ok = addDependency("web-server", "database");
+    expect(ok).toBe(true);
+    expect(getDependencies("web-server")).toContain("database");
+  });
 
-    test('prevents self-dependency', () => {
-        expect(addDependency('api', 'api')).toBe(false);
-    })
+  test("prevents self-dependency", () => {
+    expect(addDependency("api", "api")).toBe(false);
+  });
 
-    test('prevents duplicate dependency', () => {
-        removeAllDependencies('app');
-        addDependency('app', 'db');
-        expect(addDependency('app', 'db')).toBe(false);
-    })
+  test("prevents duplicate dependency", () => {
+    removeAllDependencies("app");
+    addDependency("app", "db");
+    expect(addDependency("app", "db")).toBe(false);
+  });
 
-    test('prevents circular dependency', () => {
-        removeAllDependencies('a');
-        removeAllDependencies('b');
-        removeAllDependencies('c');
-        addDependency('a', 'b');
-        addDependency('b', 'c');
-        // c -> a would create a cycle
-        expect(addDependency('c', 'a')).toBe(false);
-    })
-})
+  test("prevents circular dependency", () => {
+    removeAllDependencies("a");
+    removeAllDependencies("b");
+    removeAllDependencies("c");
+    addDependency("a", "b");
+    addDependency("b", "c");
+    // c -> a would create a cycle
+    expect(addDependency("c", "a")).toBe(false);
+  });
+});
 
-describe('getDependencyGraph', () => {
-    test('returns full graph', () => {
-        removeAllDependencies('svc-a');
-        removeAllDependencies('svc-b');
-        addDependency('svc-a', 'svc-b');
-        const graph = getDependencyGraph();
-        expect(graph['svc-a']).toContain('svc-b');
-    })
-})
+describe("getDependencyGraph", () => {
+  test("returns full graph", () => {
+    removeAllDependencies("svc-a");
+    removeAllDependencies("svc-b");
+    addDependency("svc-a", "svc-b");
+    const graph = getDependencyGraph();
+    expect(graph["svc-a"]).toContain("svc-b");
+  });
+});
 
-describe('getDependents', () => {
-    test('finds processes that depend on a target', () => {
-        removeAllDependencies('frontend');
-        removeAllDependencies('backend');
-        addDependency('frontend', 'backend');
-        expect(getDependents('backend')).toContain('frontend');
-    })
-})
+describe("getDependents", () => {
+  test("finds processes that depend on a target", () => {
+    removeAllDependencies("frontend");
+    removeAllDependencies("backend");
+    addDependency("frontend", "backend");
+    expect(getDependents("backend")).toContain("frontend");
+  });
+});
 
-describe('removeDependency', () => {
-    test('removes an existing dependency', () => {
-        removeAllDependencies('x');
-        addDependency('x', 'y');
-        expect(getDependencies('x')).toContain('y');
-        removeDependency('x', 'y');
-        expect(getDependencies('x')).not.toContain('y');
-    })
-})
+describe("removeDependency", () => {
+  test("removes an existing dependency", () => {
+    removeAllDependencies("x");
+    addDependency("x", "y");
+    expect(getDependencies("x")).toContain("y");
+    removeDependency("x", "y");
+    expect(getDependencies("x")).not.toContain("y");
+  });
+});

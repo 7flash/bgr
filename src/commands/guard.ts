@@ -1,11 +1,25 @@
-import { addHistoryEntry, getProcess, retryDatabaseOperation, updateProcessEnv } from "../db";
+import {
+  addHistoryEntry,
+  getProcess,
+  retryDatabaseOperation,
+  updateProcessEnv,
+} from "../db";
 import { announce, error } from "../logger";
 import { ensureProcessWatcher, stopProcessWatcher } from "../watcher";
-import { isInternalProcessName, parseEnvString, stringifyEnvString } from "../utils";
+import {
+  isInternalProcessName,
+  parseEnvString,
+  stringifyEnvString,
+} from "../utils";
 
-export async function handleGuardToggle(targetName: string | undefined, enabled: boolean) {
+export async function handleGuardToggle(
+  targetName: string | undefined,
+  enabled: boolean,
+) {
   if (!targetName) {
-    error(`Please provide a process name. Example: bunx bgrun myapp ${enabled ? '--guard' : '--guard-off'}`);
+    error(
+      `Please provide a process name. Example: bunx bgrun myapp ${enabled ? "--guard" : "--guard-off"}`,
+    );
   }
 
   if (isInternalProcessName(targetName)) {
@@ -22,7 +36,9 @@ export async function handleGuardToggle(targetName: string | undefined, enabled:
 
   if (enabled) {
     env.BGR_KEEP_ALIVE = "true";
-    await retryDatabaseOperation(() => updateProcessEnv(targetName, stringifyEnvString(env)));
+    await retryDatabaseOperation(() =>
+      updateProcessEnv(targetName, stringifyEnvString(env)),
+    );
     await ensureProcessWatcher(targetName);
     addHistoryEntry(targetName, "guard_on", proc.pid);
 
@@ -36,7 +52,9 @@ export async function handleGuardToggle(targetName: string | undefined, enabled:
   }
 
   delete env.BGR_KEEP_ALIVE;
-  await retryDatabaseOperation(() => updateProcessEnv(targetName, stringifyEnvString(env)));
+  await retryDatabaseOperation(() =>
+    updateProcessEnv(targetName, stringifyEnvString(env)),
+  );
   await stopProcessWatcher(targetName);
   addHistoryEntry(targetName, "guard_off", proc.pid);
 

@@ -10,8 +10,7 @@ export function describeRuntime(): string {
   // Deno exposes globalThis.Deno. Avoid referencing the bare identifier
   // directly so this file remains safe in every JS runtime.
   const maybeDeno = (globalThis as Record<string, unknown>).Deno as
-    | { version?: { deno?: string } }
-    | undefined;
+    { version?: { deno?: string } } | undefined;
   if (maybeDeno?.version?.deno) return `deno ${maybeDeno.version.deno}`;
   return "unknown JavaScript runtime";
 }

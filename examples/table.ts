@@ -25,7 +25,8 @@ const processes: ProcessTableRow[] = [
     pid: 12678,
     name: "long-running-data-processor-service-instance-alpha",
     port: "",
-    command: "python -m processor.main --config /etc/processor/config.prod.json --logfile /var/log/processor.log",
+    command:
+      "python -m processor.main --config /etc/processor/config.prod.json --logfile /var/log/processor.log",
     workdir: "/var/opt/services/data-processor/instances/alpha/current",
     status: chalk.green.bold("● Running"),
     runtime: "8 hours",
@@ -58,7 +59,9 @@ const processes: ProcessTableRow[] = [
 const termWidth = getTerminalWidth();
 console.log(chalk.bold.blue(`\nTerminal width: ${termWidth} columns\n`));
 
-console.log(chalk.bold.green("--- Rendering Process Table (Hybrid Method) ---"));
+console.log(
+  chalk.bold.green("--- Rendering Process Table (Hybrid Method) ---"),
+);
 
 // Pass the terminal width to the renderer
 const tableOptions = { maxWidth: termWidth };

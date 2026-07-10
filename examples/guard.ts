@@ -2,7 +2,7 @@
 /**
  * Process Guard for BGR
  * Monitors a process and automatically restarts it if it stops
- * 
+ *
  * Usage: bun guard.ts <process-name> [check-interval-seconds]
  */
 
@@ -14,7 +14,9 @@ async function main() {
 
   if (!processName) {
     console.error("Error: Process name required");
-    console.error("Usage: bun guard.ts <process-name> [check-interval-seconds]");
+    console.error(
+      "Usage: bun guard.ts <process-name> [check-interval-seconds]",
+    );
     process.exit(1);
   }
 
@@ -28,7 +30,8 @@ async function main() {
       if (result.stdout.includes("○ Stopped") || result.exitCode !== 0) {
         console.log(`Process "${processName}" is not running. Restarting...`);
 
-        const restartResult = await $`bgr ${processName} --restart --force`.nothrow();
+        const restartResult =
+          await $`bgr ${processName} --restart --force`.nothrow();
 
         if (restartResult.exitCode === 0) {
           console.log(`Restarted "${processName}"`);
@@ -37,7 +40,9 @@ async function main() {
           console.error(restartResult.stderr);
         }
       } else {
-        console.log(`Process "${processName}" is running (${new Date().toLocaleTimeString()})`);
+        console.log(
+          `Process "${processName}" is running (${new Date().toLocaleTimeString()})`,
+        );
       }
     } catch (error) {
       console.error(`Error checking process: ${(error as Error).message}`);
@@ -47,7 +52,7 @@ async function main() {
   }
 }
 
-main().catch(err => {
+main().catch((err) => {
   console.error("Fatal error:", err);
   process.exit(1);
 });

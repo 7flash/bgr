@@ -54,11 +54,11 @@ export {
   isWatcherProcessName,
   getWatcherProcessName,
   getWatchedProcessName,
-} from '../../dist/api.js'
+} from "../../dist/api.js";
 
-export { deployProcess, deployAllProcesses } from '../../dist/deploy.js'
-export { buildDepGraph } from '../../dist/deps.js'
-export { rotateAllLogs } from '../../dist/log-rotation.js'
+export { deployProcess, deployAllProcesses } from "../../dist/deploy.js";
+export { buildDepGraph } from "../../dist/deps.js";
+export { rotateAllLogs } from "../../dist/log-rotation.js";
 
-export const guardEvents: any[] = []
-export const guardRestartCounts = new Map<string, number>()
+export const guardEvents: any[] = [];
+export const guardRestartCounts = new Map<string, number>();
