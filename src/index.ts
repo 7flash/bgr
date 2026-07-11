@@ -179,6 +179,8 @@ async function showHelp() {
       --log-stdout           Show only stdout logs
       --log-stderr           Show only stderr logs
       --lines <n>            Number of log lines to show (default: all)
+      --tail [n]             Show last n lines and keep following (default: 100)
+      --follow               Keep following logs after printing initial lines
       --version              Show version
       --debug                Show debug info (DB path, BGR home, etc.)
       --dashboard            Launch web dashboard as bgrun-managed process
@@ -204,6 +206,9 @@ async function showHelp() {
       bunx bgrun --name myapp --command "bun run dev" --directory . --watch
       bunx bgrun --name myapp --logs-dir .data --command "bun run dev" --directory .
       bunx bgrun myapp --logs --lines 50
+      bunx bgrun myapp --logs --tail
+      bunx bgrun myapp --logs --tail 200
+      bunx bgrun myapp --log-stderr --follow --lines 100
   `;
   console.log(usage);
 }
@@ -236,6 +241,8 @@ const cliArgOptions = {
   "log-stdout": { type: "boolean" as const },
   "log-stderr": { type: "boolean" as const },
   lines: { type: "string" as const },
+  tail: { type: "boolean" as const },
+  follow: { type: "boolean" as const },
   filter: { type: "string" as const },
   version: { type: "boolean" as const, short: "v" },
   help: { type: "boolean" as const },
@@ -251,6 +258,44 @@ const cliArgOptions = {
   "_watch-process": { type: "string" as const },
   port: { type: "string" as const },
 };
+
+function parsePositiveInt(value: unknown): number | undefined {
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  const parsed = Number.parseInt(String(value), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function getTailLineCount(
+  rawArgs: string[],
+  fallbackLines: unknown,
+): number | undefined {
+  const inline = rawArgs.find((arg) => arg.startsWith("--tail="));
+  if (inline) {
+    const parsed = parsePositiveInt(inline.slice("--tail=".length));
+    if (parsed) return parsed;
+  }
+
+  const tailIndex = rawArgs.indexOf("--tail");
+  if (tailIndex >= 0) {
+    const next = rawArgs[tailIndex + 1];
+    const parsed =
+      next && !next.startsWith("-") ? parsePositiveInt(next) : undefined;
+    return parsed ?? parsePositiveInt(fallbackLines) ?? 100;
+  }
+
+  return parsePositiveInt(fallbackLines);
+}
+
+function wantsLogFollow(
+  rawArgs: string[],
+  values: Record<string, unknown>,
+): boolean {
+  return (
+    values.follow === true ||
+    values.tail === true ||
+    rawArgs.some((arg) => arg === "--tail" || arg.startsWith("--tail="))
+  );
+}
 
 // Re-running parseArgs logic properly
 async function run() {
@@ -274,6 +319,8 @@ async function run() {
       values.logs ||
       values["log-stdout"] ||
       values["log-stderr"] ||
+      values.tail ||
+      values.follow ||
       values.watch ||
       values.hot ||
       values.json ||
@@ -394,7 +441,7 @@ async function run() {
           : values["log-stderr"]
             ? "stderr"
             : "both",
-        lines: values.lines ? parseInt(values.lines as string) : undefined,
+        lines: getTailLineCount(rawArgs, values.lines),
       });
     } else {
       await handleRun(runOptions);
@@ -479,7 +526,7 @@ async function run() {
           : values["log-stderr"]
             ? "stderr"
             : "both",
-        lines: values.lines ? parseInt(values.lines as string) : undefined,
+        lines: getTailLineCount(rawArgs, values.lines),
       });
     } else {
       await handleRun(runOptions);
@@ -852,7 +899,13 @@ async function run() {
   }
 
   // Logs
-  if (values.logs || values["log-stdout"] || values["log-stderr"]) {
+  if (
+    values.logs ||
+    values["log-stdout"] ||
+    values["log-stderr"] ||
+    values.tail ||
+    values.follow
+  ) {
     if (!name) {
       error("Please specify a process name to show logs for.");
     }
@@ -861,8 +914,10 @@ async function run() {
       : values["log-stderr"]
         ? "stderr"
         : "both";
-    const lines = values.lines ? parseInt(values.lines as string) : undefined;
-    await showLogs(name, logType, lines);
+    const lines = getTailLineCount(rawArgs, values.lines);
+    await showLogs(name, logType, lines, {
+      follow: wantsLogFollow(rawArgs, values as Record<string, unknown>),
+    });
     return;
   }
 
@@ -885,7 +940,7 @@ async function run() {
       {
         showLogs: (values.logs as boolean) || false,
         logType: "both",
-        lines: values.lines ? parseInt(values.lines as string) : undefined,
+        lines: getTailLineCount(rawArgs, values.lines),
       },
     );
     return;
