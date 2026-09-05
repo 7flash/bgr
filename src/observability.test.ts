@@ -1,13 +1,28 @@
 import { describe, expect, test } from "bun:test";
-import { measureRequired } from "./observability";
+import {
+  measureRequired,
+  type ChildMeasure,
+  type MeasureFunction,
+} from "./observability";
 
-const fakeMeasure = (async (_label: any, operation: () => Promise<any>) => {
+const fakeChildMeasure: ChildMeasure = async (_label, operation) => {
   try {
     return await operation();
   } catch {
     return null;
   }
-}) as any;
+};
+
+const fakeMeasure = (async (
+  _label: string,
+  operation: (childMeasure: ChildMeasure) => Promise<unknown> | unknown,
+) => {
+  try {
+    return await operation(fakeChildMeasure);
+  } catch {
+    return null;
+  }
+}) as MeasureFunction;
 
 describe("measureRequired", () => {
   test("returns successful values", async () => {

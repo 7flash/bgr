@@ -10,10 +10,16 @@ export const runMeasure = createMeasure("run");
 export const platformMeasure = createMeasure("platform");
 export const watcherMeasure = createMeasure("watcher");
 export const serverMeasure = createMeasure("server");
+export const dbMeasure = createMeasure("db");
+export const resourceMeasure = createMeasure("resources");
 
 export type MeasureScope = ReturnType<typeof createMeasure>;
 export type MeasureFunction = MeasureScope["measure"];
 export type MeasureLabel = string;
+export type ChildMeasure = <T>(
+  label: MeasureLabel,
+  operation: () => Promise<T> | T,
+) => Promise<T | null>;
 
 /**
  * measure-fn deliberately turns thrown errors into `null`. That is ideal for
@@ -24,11 +30,11 @@ export type MeasureLabel = string;
 export async function measureRequired<T>(
   measure: MeasureFunction,
   label: MeasureLabel,
-  operation: (childMeasure: any) => Promise<T> | T,
+  operation: (childMeasure: ChildMeasure) => Promise<T> | T,
 ): Promise<T> {
   let failure: unknown;
 
-  const result = (await measure(label, async (childMeasure: any) => {
+  const result = (await measure(label, async (childMeasure: ChildMeasure) => {
     try {
       return { value: await operation(childMeasure) };
     } catch (error) {

@@ -386,9 +386,9 @@ export async function handleRun(options: CommandOptions) {
           async () => {
             try {
               return await parseConfigFile(fullConfigPath);
-            } catch (err: any) {
+            } catch (error: unknown) {
               console.warn(
-                `Warning: Failed to parse config file ${finalConfigPath}: ${err.message}`,
+                `Warning: Failed to parse config file ${finalConfigPath}: ${getErrorMessage(error)}`,
               );
               return null;
             }

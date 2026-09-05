@@ -1,7 +1,7 @@
 /**
  * GET /api/next-port — Find the next available TCP port.
  */
-import { getAllProcesses, parseCommandEnv } from "../../../lib/runtime";
+import { getCurrentProcesses, parseCommandEnv } from "../../../lib/runtime";
 
 const DEFAULT_BASE_PORT = 3001;
 const MIN_PORT = 1;
@@ -35,7 +35,7 @@ export async function GET(req: Request) {
   }
 
   const usedPorts = new Set<number>();
-  for (const proc of getAllProcesses()) {
+  for (const proc of getCurrentProcesses()) {
     const envStr = proc.env || "";
     const storedPortMatch = envStr.match(/(?:^|,)(?:PORT|BUN_PORT)=(\d+)/);
     if (storedPortMatch) addPort(usedPorts, storedPortMatch[1]);

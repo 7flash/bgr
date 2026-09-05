@@ -10,6 +10,7 @@ import {
   apiMeasure as api,
   measureRequired,
 } from "../../../../lib/observability";
+import { jsonError } from "../../../../lib/http";
 
 export async function POST(
   _req: Request,
@@ -37,10 +38,7 @@ export async function POST(
     updateProcessPid(name, 0);
     addHistoryEntry(name, "stop", proc.pid);
     return Response.json({ success: true });
-  } catch (error: any) {
-    return Response.json(
-      { error: error?.message || String(error) },
-      { status: 500 },
-    );
+  } catch (error: unknown) {
+    return jsonError(error);
   }
 }

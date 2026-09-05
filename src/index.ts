@@ -4,6 +4,7 @@ import { parseArgs } from "util";
 import { getVersion } from "./utils";
 import { handleRun } from "./commands/run";
 import { showAll } from "./commands/list";
+import { showTop } from "./commands/top";
 import { handleMeta } from "./commands/meta";
 import { handleDoctor } from "./commands/doctor";
 import {
@@ -15,11 +16,12 @@ import {
 import { handleWatch } from "./commands/watch";
 import { showLogs } from "./commands/logs";
 import { showDetails } from "./commands/details";
-import { handleEnvit, parseEnvitArgs } from "./commands/envit";
+import { handleEnvit, parseEnvitArgs, type EnvitShell } from "./commands/envit";
 import { handleInline, parseInlineArgs } from "./commands/inline";
 import { handleGuardToggle } from "./commands/guard";
 import type { CommandOptions } from "./types";
 import { error, announce } from "./logger";
+import { getErrorMessage } from "./error-utils";
 // startServer is dynamically imported only when --_serve is used
 // to avoid loading melina (which has side-effects) on every bgrun command
 import {
@@ -35,6 +37,7 @@ import {
   findPidByPort,
   psExec,
   resolvePidWithPorts,
+  getSystemProcessResources,
 } from "./platform";
 import {
   insertProcess,
@@ -83,14 +86,14 @@ function redirectConsoleToFiles() {
   if (stdoutPath) {
     const origLog = console.log;
     const origWarn = console.warn;
-    console.log = (...args: any[]) => {
+    console.log = (...args: unknown[]) => {
       const line = `[${timestamp()}] ${stripAnsi(args.map(String).join(" "))}\n`;
       try {
         appendFileSync(stdoutPath, line);
       } catch {}
       origLog.apply(console, args); // Also keep original (goes to /dev/null when detached, but useful if attached)
     };
-    console.warn = (...args: any[]) => {
+    console.warn = (...args: unknown[]) => {
       const line = `[${timestamp()}] WARN: ${stripAnsi(args.map(String).join(" "))}\n`;
       try {
         appendFileSync(stdoutPath, line);
@@ -101,7 +104,7 @@ function redirectConsoleToFiles() {
 
   if (stderrPath) {
     const origError = console.error;
-    console.error = (...args: any[]) => {
+    console.error = (...args: unknown[]) => {
       const line = `[${timestamp()}] ERROR: ${stripAnsi(args.map(String).join(" "))}\n`;
       try {
         appendFileSync(stderrPath, line);
@@ -140,6 +143,9 @@ async function showHelp() {
       bunx bgrun                     List all processes
       bunx bgrun --json              Fast JSON process list
       bunx bgrun --json-full         Full JSON list with verified status, ports, memory
+      bunx bgrun top                 Live resource snapshot for managed processes
+      bunx bgrun top --watch         Refresh CPU/RAM/ports continuously
+      bunx bgrun top --system        Include all system processes
       bunx bgrun --meta              Show DB/runtime metadata only
       bunx bgrun --meta --json       Machine-readable DB/runtime metadata only
       bunx bgrun --doctor            Metadata plus process registry names
@@ -159,6 +165,7 @@ async function showHelp() {
       bunx bgrun --clean            Remove all stopped processes
       bunx bgrun --nuke             Delete ALL processes
       bunx bgrun --kill-port <n>    Kill whatever is currently listening on a port
+      bunx bgrun --kill-pid <pid>   Explicitly terminate a PID (admin command)
 
     ${chalk.yellow("Options:")}
       --name <string>        Process name (required for new)
@@ -174,7 +181,13 @@ async function showHelp() {
       --logs-dir <path>      Directory for derived stdout/stderr logs
       --fetch                Fetch latest git changes before running
       --json                 Output in JSON format
-      --filter <group>       Filter list by BGR_GROUP
+      --filter <group>       Filter list/top by BGR_GROUP
+      --cpu                  Sort top by CPU
+      --memory               Sort top by memory (default)
+      --ports                Show only processes with listening TCP ports
+      --system               Top: include all system processes
+      --interval <seconds>   Top watch refresh interval (default: 2)
+      --limit <n>            Top result limit (system default: 30)
       --logs                 Show logs
       --log-stdout           Show only stdout logs
       --log-stderr           Show only stderr logs
@@ -187,6 +200,7 @@ async function showHelp() {
       --guard                Enable per-process crash watcher
       --guard-off            Disable per-process crash watcher
       --kill-port <number>   Kill the process currently using a port
+      --kill-pid <pid>       Explicitly terminate a PID; add --force for SIGKILL
       --port <number>        Port for dashboard (default: 3000)
       --help                 Show this help message
 
@@ -200,7 +214,11 @@ async function showHelp() {
       Invoke-Expression (bunx bgrun --env)
       eval "$(bunx bgrun --env --shell sh)"
       bunx bgrun --dashboard
+      bunx bgrun top --watch
+      bunx bgrun top --system --cpu --limit 20
+      bunx bgrun top --ports
       bunx bgrun --kill-port 3000
+      bunx bgrun --kill-pid 1234 --force
       bunx bgrun myapp --guard
       bunx bgrun myapp --guard-off
       bunx bgrun --name myapp --command "bun run dev" --directory . --watch
@@ -244,6 +262,12 @@ const cliArgOptions = {
   tail: { type: "boolean" as const },
   follow: { type: "boolean" as const },
   filter: { type: "string" as const },
+  cpu: { type: "boolean" as const },
+  memory: { type: "boolean" as const },
+  ports: { type: "boolean" as const },
+  system: { type: "boolean" as const },
+  interval: { type: "string" as const },
+  limit: { type: "string" as const },
   version: { type: "boolean" as const, short: "v" },
   help: { type: "boolean" as const },
   db: { type: "string" as const },
@@ -254,6 +278,7 @@ const cliArgOptions = {
   "guard-off": { type: "boolean" as const },
   debug: { type: "boolean" as const },
   "kill-port": { type: "string" as const },
+  "kill-pid": { type: "string" as const },
   _serve: { type: "boolean" as const },
   "_watch-process": { type: "string" as const },
   port: { type: "string" as const },
@@ -309,6 +334,11 @@ async function run() {
       values.help ||
       values.debug ||
       values["kill-port"] ||
+      values["kill-pid"] ||
+      values.cpu ||
+      values.memory ||
+      values.ports ||
+      values.system ||
       values.nuke ||
       values.clean ||
       values["restart-all"] ||
@@ -484,7 +514,7 @@ async function run() {
     await handleEnvit({
       directory: values.directory as string | undefined,
       configPath: (values.config as string | undefined) || positionals[0],
-      shell: values.shell as any,
+      shell: values.shell as EnvitShell | undefined,
     });
     return;
   }
@@ -724,6 +754,28 @@ async function run() {
     return;
   }
 
+  if (positionals[0] === "top") {
+    if (positionals.length > 1) {
+      error("bgrun top does not accept additional process names.");
+    }
+    if (values.system && values.filter) {
+      error("--filter applies to managed processes only; remove --system.");
+    }
+    const intervalSeconds = parsePositiveInt(values.interval) || 2;
+    const explicitLimit = parsePositiveInt(values.limit);
+    await showTop({
+      watch: Boolean(values.watch),
+      intervalMs: intervalSeconds * 1000,
+      system: Boolean(values.system),
+      portsOnly: Boolean(values.ports),
+      sort: values.cpu ? "cpu" : values.memory ? "memory" : "memory",
+      filter: values.filter as string | undefined,
+      limit: explicitLimit || (values.system ? 30 : undefined),
+      json: wantsJson,
+    });
+    return;
+  }
+
   if (values.guard || values["guard-off"]) {
     await handleGuardToggle(positionals[0], Boolean(values.guard));
     return;
@@ -753,6 +805,26 @@ async function run() {
       Platform:  ${process.platform}
       Bun:       ${Bun.version}
     `);
+    return;
+  }
+
+  if (values["kill-pid"]) {
+    const pid = parseInt(String(values["kill-pid"]), 10);
+    if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) {
+      error("Please provide a valid non-system PID for --kill-pid.");
+    }
+
+    const target = (await getSystemProcessResources()).find(
+      (proc) => proc.pid === pid,
+    );
+    if (!target) {
+      error(`PID ${pid} is not running.`);
+    }
+
+    await terminateProcess(pid, Boolean(values.force));
+    console.log(
+      `pid=${pid} terminated${target.executable ? ` process=${target.executable}` : ""}`,
+    );
     return;
   }
 
@@ -791,8 +863,8 @@ async function run() {
 
   // Restart all registered processes
   if (values["restart-all"]) {
-    const { getAllProcesses } = await import("./db");
-    const all = getAllProcesses();
+    const { getCurrentProcesses } = await import("./db");
+    const all = getCurrentProcesses();
     if (all.length === 0) {
       error("No processes registered.");
       return;
@@ -807,9 +879,11 @@ async function run() {
           force: true,
           remoteName: "",
         });
-      } catch (err: any) {
+      } catch (error: unknown) {
         console.error(
-          chalk.red(`  ✗ Failed to restart ${proc.name}: ${err.message}`),
+          chalk.red(
+            `  ✗ Failed to restart ${proc.name}: ${getErrorMessage(error)}`,
+          ),
         );
       }
     }
@@ -819,8 +893,8 @@ async function run() {
 
   // Stop all running processes
   if (values["stop-all"]) {
-    const { getAllProcesses } = await import("./db");
-    const all = getAllProcesses();
+    const { getCurrentProcesses } = await import("./db");
+    const all = getCurrentProcesses();
     if (all.length === 0) {
       error("No processes registered.");
       return;
@@ -836,9 +910,11 @@ async function run() {
         } else {
           console.log(chalk.gray(`  ○ ${proc.name} already stopped`));
         }
-      } catch (err: any) {
+      } catch (error: unknown) {
         console.error(
-          chalk.red(`  ✗ Failed to stop ${proc.name}: ${err.message}`),
+          chalk.red(
+            `  ✗ Failed to stop ${proc.name}: ${getErrorMessage(error)}`,
+          ),
         );
       }
     }

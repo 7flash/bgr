@@ -929,6 +929,164 @@ export async function getProcessBatchResources(
   );
 }
 
+export type SystemProcessResource = {
+  pid: number;
+  cpu: number;
+  memory: number;
+  executable: string;
+  command: string;
+};
+
+/**
+ * Snapshot all system processes in one OS query.
+ *
+ * On Unix, cpu is instantaneous percent and memory is RSS bytes. On Windows
+ * the lightweight Get-Process fallback exposes cumulative CPU seconds; callers
+ * should treat that as diagnostic rather than a precise instantaneous percent.
+ */
+export async function getSystemProcessResources(): Promise<
+  SystemProcessResource[]
+> {
+  return (
+    (await plat.measure("System resource snapshot", async () => {
+      try {
+        if (isWindows()) {
+          const output = await psExec(
+            `Get-Process -ErrorAction SilentlyContinue | ForEach-Object { Write-Output "$($_.Id)|$([double]$_.CPU)|$($_.WorkingSet64)|$($_.ProcessName)|$($_.Path)" }`,
+            5000,
+          );
+          const rows: SystemProcessResource[] = [];
+          for (const line of output.split("\n")) {
+            const parts = line.split("|");
+            if (parts.length < 4) continue;
+            const pid = parseInt(parts[0]?.trim() || "", 10);
+            if (!Number.isInteger(pid) || pid <= 0) continue;
+            rows.push({
+              pid,
+              cpu: Number(parts[1]) || 0,
+              memory: Number(parts[2]) || 0,
+              executable: parts[3]?.trim() || "",
+              command:
+                parts.slice(4).join("|").trim() || parts[3]?.trim() || "",
+            });
+          }
+          return rows;
+        }
+
+        const output = await $`ps -eo pid=,pcpu=,rss=,comm=,args=`
+          .nothrow()
+          .quiet()
+          .text();
+        const rows: SystemProcessResource[] = [];
+        for (const line of output.split("\n")) {
+          const match = line.match(
+            /^\s*(\d+)\s+([0-9.]+)\s+(\d+)\s+(\S+)\s*(.*)$/,
+          );
+          if (!match) continue;
+          const pid = parseInt(match[1], 10);
+          if (!Number.isInteger(pid) || pid <= 0) continue;
+          rows.push({
+            pid,
+            cpu: parseFloat(match[2]) || 0,
+            memory: (parseInt(match[3], 10) || 0) * 1024,
+            executable: match[4] || "",
+            command: match[5]?.trim() || match[4] || "",
+          });
+        }
+        return rows;
+      } catch {
+        return [];
+      }
+    })) ?? []
+  );
+}
+
+function addListeningPort(
+  map: Map<number, Set<number>>,
+  pid: number,
+  port: number,
+  filter: Set<number> | null,
+) {
+  if (pid <= 0 || port <= 0 || port > 65535) return;
+  if (filter && !filter.has(pid)) return;
+  const ports = map.get(pid) || new Set<number>();
+  ports.add(port);
+  map.set(pid, ports);
+}
+
+/**
+ * Snapshot listening TCP ports for many processes with one OS query.
+ * This is intentionally LISTEN-only so reverse-proxy/client connections are
+ * never confused with local port ownership.
+ */
+export async function getListeningPortsByPid(
+  pids?: number[],
+): Promise<Map<number, number[]>> {
+  return (
+    (await plat.measure("Listening port snapshot", async () => {
+      const filter = pids ? new Set(pids.filter((pid) => pid > 0)) : null;
+      const result = new Map<number, Set<number>>();
+
+      try {
+        if (isWindows()) {
+          const output = await $`netstat -ano`.nothrow().quiet().text();
+          for (const line of output.split("\n")) {
+            const match = line.match(
+              /^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$/i,
+            );
+            if (!match) continue;
+            addListeningPort(
+              result,
+              parseInt(match[2], 10),
+              parseInt(match[1], 10),
+              filter,
+            );
+          }
+        } else {
+          const output = await $`ss -ltnpH`.nothrow().quiet().text();
+          for (const line of output.split("\n")) {
+            const columns = line.trim().split(/\s+/);
+            if (columns.length < 4) continue;
+            const local = columns[3] || "";
+            const portMatch = local.match(/:(\d+)$/);
+            if (!portMatch) continue;
+            const port = parseInt(portMatch[1], 10);
+            for (const pidMatch of line.matchAll(/pid=(\d+)/g)) {
+              addListeningPort(result, parseInt(pidMatch[1], 10), port, filter);
+            }
+          }
+
+          // Some ss builds hide process metadata for unprivileged callers.
+          // Fall back to one global lsof snapshot when ss cannot map any PID.
+          if (result.size === 0) {
+            const lsof = await $`lsof -nP -iTCP -sTCP:LISTEN`
+              .nothrow()
+              .quiet()
+              .text();
+            for (const line of lsof.split("\n").slice(1)) {
+              const columns = line.trim().split(/\s+/);
+              if (columns.length < 9) continue;
+              const pid = parseInt(columns[1] || "", 10);
+              const portMatch = line.match(/:(\d+)\s+\(LISTEN\)/);
+              if (!portMatch) continue;
+              addListeningPort(result, pid, parseInt(portMatch[1], 10), filter);
+            }
+          }
+        }
+      } catch {
+        // best-effort snapshot
+      }
+
+      return new Map(
+        [...result.entries()].map(([pid, ports]) => [
+          pid,
+          [...ports].sort((a, b) => a - b),
+        ]),
+      );
+    })) ?? new Map()
+  );
+}
+
 /**
  * Parse Unix lsof LISTEN output and return only true listening TCP ports.
  */

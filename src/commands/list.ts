@@ -1,4 +1,4 @@
-import { getAllProcesses } from "../db";
+import { getCurrentProcesses } from "../db";
 import {
   isProcessRunning,
   calculateRuntime,
@@ -11,6 +11,24 @@ type ShowAllOptions = {
   json?: boolean;
   jsonFull?: boolean;
   filter?: string;
+};
+
+type ProcessJsonRow = {
+  pid: number;
+  name: string;
+  ports?: number[];
+  status: "running" | "stopped";
+  statusSource: "pid-fast" | "command-verified";
+  healthChecked: boolean;
+  commandVerified: boolean;
+  parentName: string;
+  group: string | null;
+  command: string;
+  workdir: string;
+  directory: string;
+  runtime: string;
+  timestamp: string;
+  env: Record<string, string>;
 };
 
 function formatMemory(bytes: number): string {
@@ -31,25 +49,7 @@ function isPidAliveFast(pid: number): boolean {
 }
 
 function getFilteredProcesses(opts?: ShowAllOptions) {
-  const processes = getAllProcesses();
-  const latestByName = new Map<string, (typeof processes)[number]>();
-
-  for (const proc of processes) {
-    const existing = latestByName.get(proc.name);
-    if (!existing) {
-      latestByName.set(proc.name, proc);
-      continue;
-    }
-
-    if (
-      proc.timestamp > existing.timestamp ||
-      (proc.timestamp === existing.timestamp && proc.id > existing.id)
-    ) {
-      latestByName.set(proc.name, proc);
-    }
-  }
-
-  return Array.from(latestByName.values()).filter((proc) => {
+  return getCurrentProcesses().filter((proc) => {
     if (isInternalProcessName(proc.name)) return false;
     if (!opts?.filter) return true;
     const envVars = parseEnvString(proc.env);
@@ -62,7 +62,7 @@ function parentNameFromEnv(envVars: Record<string, string>): string {
 }
 
 function printFastJson(filtered: ReturnType<typeof getFilteredProcesses>) {
-  const jsonData = filtered.map((proc) => {
+  const jsonData: ProcessJsonRow[] = filtered.map((proc) => {
     const envVars = parseEnvString(proc.env);
     const running = isPidAliveFast(proc.pid);
     return {
@@ -106,7 +106,7 @@ export async function showAll(opts?: ShowAllOptions) {
   }
 
   if (opts?.json) {
-    const jsonData: any[] = [];
+    const jsonData: ProcessJsonRow[] = [];
 
     for (const proc of filtered) {
       const isRunning =

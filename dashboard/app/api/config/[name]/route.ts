@@ -7,18 +7,20 @@
  * not become an arbitrary filesystem write primitive.
  */
 import { getProcess } from "../../../../lib/runtime";
+import { jsonError, readJsonObject } from "../../../../lib/http";
 import { isAbsolute, relative, resolve } from "path";
 import { readFile, writeFile } from "fs/promises";
 
+type ConfigProcess = NonNullable<ReturnType<typeof getProcess>>;
 type ConfigResolution =
   | { path: string; error: null }
   | { path: null; error: "missing" | "outside-workdir" };
 
-function resolveConfigPath(proc: any): ConfigResolution {
-  if (!proc?.configPath) return { path: null, error: "missing" };
+function resolveConfigPath(proc: ConfigProcess): ConfigResolution {
+  if (!proc.configPath) return { path: null, error: "missing" };
 
-  const workdir = resolve(String(proc.workdir || "."));
-  const configPath = resolve(workdir, String(proc.configPath));
+  const workdir = resolve(proc.workdir || ".");
+  const configPath = resolve(workdir, proc.configPath);
   const rel = relative(workdir, configPath);
 
   if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) {
@@ -28,7 +30,7 @@ function resolveConfigPath(proc: any): ConfigResolution {
   return { path: null, error: "outside-workdir" };
 }
 
-function configPathError(result: ConfigResolution) {
+function configPathError(result: ConfigResolution): Response | null {
   if (result.error === "outside-workdir") {
     return Response.json(
       {
@@ -42,7 +44,7 @@ function configPathError(result: ConfigResolution) {
 }
 
 export async function GET(
-  req: Request,
+  _req: Request,
   { params }: { params: { name: string } },
 ) {
   const name = decodeURIComponent(params.name);
@@ -89,8 +91,8 @@ export async function PUT(
   }
 
   try {
-    const body = await req.json();
-    if (typeof body?.content !== "string") {
+    const body = await readJsonObject(req);
+    if (typeof body.content !== "string") {
       return Response.json(
         { error: "content must be a string" },
         { status: 400 },
@@ -98,7 +100,7 @@ export async function PUT(
     }
     await writeFile(resolved.path, body.content, "utf-8");
     return Response.json({ success: true, path: resolved.path });
-  } catch (e: any) {
-    return Response.json({ error: e.message }, { status: 500 });
+  } catch (error: unknown) {
+    return jsonError(error);
   }
 }

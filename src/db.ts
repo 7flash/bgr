@@ -1,8 +1,11 @@
 import { Database, z } from "sqlite-zod-orm";
 import { getHomeDir, ensureDir } from "./platform";
 import { join } from "path";
-import { sleep } from "bun";
 import { existsSync, copyFileSync } from "fs";
+import { retry } from "./async-utils";
+import { hasErrorCode } from "./error-utils";
+import { dbMeasure, measureRequired } from "./observability";
+import { selectLatestByName } from "./process-records";
 
 // =============================================================================
 // SCHEMA (inline — single table, no need for a separate file)
@@ -109,7 +112,7 @@ export const db = new Database(
 // QUERY FUNCTIONS
 // =============================================================================
 
-export function getProcess(name: string) {
+export function getProcess(name: string): Process | null {
   return (
     db.process
       .select()
@@ -120,8 +123,20 @@ export function getProcess(name: string) {
   );
 }
 
-export function getAllProcesses() {
+/** Raw process rows, including historical duplicates. Prefer getCurrentProcesses() for runtime behavior. */
+export function getAllProcesses(): Process[] {
   return db.process.select().all();
+}
+
+/**
+ * Return one canonical row per process name.
+ *
+ * Process rows are append-oriented, so callers should not each reimplement the
+ * "latest row wins" rule. Keeping it here prevents list/dashboard/guard code
+ * from disagreeing about which row represents a process.
+ */
+export function getCurrentProcesses(): Process[] {
+  return selectLatestByName(getAllProcesses());
 }
 
 // =============================================================================
@@ -234,7 +249,7 @@ export function deleteTemplate(name: string) {
 // HISTORY FUNCTIONS
 // =============================================================================
 
-export function getProcessHistory(name: string, limit = 50) {
+export function getProcessHistory(name: string, limit = 50): History[] {
   return db.history
     .select()
     .where({ process_name: name })
@@ -247,7 +262,7 @@ export function addHistoryEntry(
   processName: string,
   event: string,
   pid?: number,
-  metadata = {},
+  metadata: Record<string, unknown> = {},
 ) {
   return db.history.insert({
     process_name: processName,
@@ -257,8 +272,30 @@ export function addHistoryEntry(
   });
 }
 
-export function getRecentHistory(limit = 100) {
+export function getRecentHistory(limit = 100): History[] {
   return db.history.select().orderBy("timestamp", "desc").limit(limit).all();
+}
+
+export function getHistoryByEvent(event: string): History[] {
+  return db.history.select().where({ event }).all();
+}
+
+export function getRecentHistoryByEvents(
+  events: readonly string[],
+  limit = 100,
+): History[] {
+  if (limit <= 0 || events.length === 0) return [];
+  const eventSet = new Set(events);
+
+  // The ORM does not expose an IN helper here, so keep filtering inside the DB
+  // repository rather than leaking storage details into watcher/API modules.
+  return db.history
+    .select()
+    .orderBy("timestamp", "desc")
+    .limit(Math.max(limit * 4, limit))
+    .all()
+    .filter((row) => eventSet.has(row.event))
+    .slice(0, limit);
 }
 
 export function clearOldHistory(daysToKeep = 30) {
@@ -378,7 +415,7 @@ function wouldCreateCycle(processName: string, dependsOn: string): boolean {
 /** Get topological start order (processes with no deps first) */
 export function getStartOrder(): string[] {
   const graph = getDependencyGraph();
-  const allProcesses = getAllProcesses().map((p) => p.name);
+  const allProcesses = getCurrentProcesses().map((p) => p.name);
   const allNames = new Set(allProcesses);
 
   // Build in-degree map
@@ -433,20 +470,15 @@ export function getDbInfo() {
 // =============================================================================
 
 export async function retryDatabaseOperation<T>(
-  operation: () => T,
+  operation: () => T | Promise<T>,
   maxRetries = 5,
   delay = 100,
 ): Promise<T> {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      return operation();
-    } catch (err: any) {
-      if (err?.code === "SQLITE_BUSY" && attempt < maxRetries) {
-        await sleep(delay * attempt);
-        continue;
-      }
-      throw err;
-    }
-  }
-  throw new Error("Max retries reached for database operation");
+  return measureRequired(dbMeasure.measure, "Retryable database write", () =>
+    retry(operation, {
+      attempts: maxRetries,
+      delayMs: delay,
+      shouldRetry: (error) => hasErrorCode(error, "SQLITE_BUSY"),
+    }),
+  );
 }

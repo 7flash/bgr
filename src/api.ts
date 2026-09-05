@@ -5,13 +5,20 @@
  */
 
 // --- Types ---
-export type { Process } from "./db";
+export type { Process, History } from "./db";
+export type { SystemProcessResource } from "./platform";
+export type {
+  GuardEvent,
+  GuardRestartMetadata,
+  GuardRestartReason,
+} from "./history-events";
 export type { CommandOptions } from "./types";
 
 // --- Database Operations ---
 export {
   db,
   getAllProcesses,
+  getCurrentProcesses,
   getProcess,
   insertProcess,
   removeProcess,
@@ -24,6 +31,8 @@ export {
   deleteTemplate,
   getProcessHistory,
   getRecentHistory,
+  getHistoryByEvent,
+  getRecentHistoryByEvents,
   addHistoryEntry,
   getDependencyGraph,
   addDependency,
@@ -52,6 +61,8 @@ export {
   getHomeDir,
   isWindows,
   getProcessBatchResources,
+  getSystemProcessResources,
+  getListeningPortsByPid,
   getProcessMemory,
   reconcileProcessPids,
   resolvePidWithPorts,
@@ -74,8 +85,38 @@ export {
   getGuardRestartCounts,
   getRecentGuardEvents,
 } from "./watcher";
+export type {
+  ResourceSnapshotRow,
+  ResourceSnapshotOptions,
+  ResourceSort,
+} from "./resource-monitor";
+export {
+  sampleManagedResources,
+  sampleSystemResources,
+  sortResourceRows,
+} from "./resource-monitor";
 
 // --- Utilities ---
+export { getErrorCode, getErrorMessage, hasErrorCode } from "./error-utils";
+export {
+  historyRowToGuardEvent,
+  parseGuardRestartMetadata,
+} from "./history-events";
+export {
+  measureRequired,
+  runMeasure,
+  platformMeasure,
+  watcherMeasure,
+  serverMeasure,
+  dbMeasure,
+  resourceMeasure,
+} from "./observability";
+export {
+  TimeoutError,
+  retry,
+  withTimeout,
+  withTimeoutFallback,
+} from "./async-utils";
 export {
   getVersion,
   calculateRuntime,
@@ -96,6 +137,7 @@ export {
 import {
   db,
   getAllProcesses,
+  getCurrentProcesses,
   getProcess,
   insertProcess,
   removeProcess,
@@ -108,6 +150,8 @@ import {
   deleteTemplate,
   getProcessHistory,
   getRecentHistory,
+  getHistoryByEvent,
+  getRecentHistoryByEvents,
   addHistoryEntry,
   getDependencyGraph,
   addDependency,
@@ -134,6 +178,8 @@ import {
   getHomeDir,
   isWindows,
   getProcessBatchResources,
+  getSystemProcessResources,
+  getListeningPortsByPid,
   getProcessMemory,
   reconcileProcessPids,
   resolvePidWithPorts,
@@ -155,6 +201,31 @@ import {
   getRecentGuardEvents,
 } from "./watcher";
 import {
+  sampleManagedResources,
+  sampleSystemResources,
+  sortResourceRows,
+} from "./resource-monitor";
+import {
+  retry,
+  withTimeout,
+  withTimeoutFallback,
+  TimeoutError,
+} from "./async-utils";
+import { getErrorCode, getErrorMessage, hasErrorCode } from "./error-utils";
+import {
+  historyRowToGuardEvent,
+  parseGuardRestartMetadata,
+} from "./history-events";
+import {
+  measureRequired,
+  runMeasure,
+  platformMeasure,
+  watcherMeasure,
+  serverMeasure,
+  dbMeasure,
+  resourceMeasure,
+} from "./observability";
+import {
   getVersion,
   calculateRuntime,
   parseEnvString,
@@ -173,6 +244,7 @@ import {
 export default {
   db,
   getAllProcesses,
+  getCurrentProcesses,
   getProcess,
   insertProcess,
   removeProcess,
@@ -185,6 +257,8 @@ export default {
   deleteTemplate,
   getProcessHistory,
   getRecentHistory,
+  getHistoryByEvent,
+  getRecentHistoryByEvents,
   addHistoryEntry,
   getDependencyGraph,
   addDependency,
@@ -209,6 +283,8 @@ export default {
   getHomeDir,
   isWindows,
   getProcessBatchResources,
+  getSystemProcessResources,
+  getListeningPortsByPid,
   getProcessMemory,
   reconcileProcessPids,
   resolvePidWithPorts,
@@ -225,6 +301,25 @@ export default {
   syncProcessWatcher,
   getGuardRestartCounts,
   getRecentGuardEvents,
+  sampleManagedResources,
+  sampleSystemResources,
+  sortResourceRows,
+  TimeoutError,
+  retry,
+  withTimeout,
+  withTimeoutFallback,
+  getErrorCode,
+  getErrorMessage,
+  hasErrorCode,
+  historyRowToGuardEvent,
+  parseGuardRestartMetadata,
+  measureRequired,
+  runMeasure,
+  platformMeasure,
+  watcherMeasure,
+  serverMeasure,
+  dbMeasure,
+  resourceMeasure,
   getVersion,
   calculateRuntime,
   parseEnvString,

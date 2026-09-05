@@ -1,6 +1,7 @@
 /** GET /api/version — return the installed bgrun version. */
 import { getVersion } from "../../../lib/runtime";
 import { apiMeasure as api, measureRequired } from "../../../lib/observability";
+import { jsonError } from "../../../lib/http";
 
 export async function GET() {
   try {
@@ -10,10 +11,7 @@ export async function GET() {
       getVersion,
     );
     return Response.json({ version });
-  } catch (error: any) {
-    return Response.json(
-      { error: error?.message || String(error) },
-      { status: 500 },
-    );
+  } catch (error: unknown) {
+    return jsonError(error);
   }
 }

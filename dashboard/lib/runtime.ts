@@ -1,6 +1,15 @@
+export type {
+  GuardEvent,
+  GuardRestartMetadata,
+  GuardRestartReason,
+  History,
+  Process,
+} from "../../dist/api.js";
+
 export {
   db,
   getAllProcesses,
+  getCurrentProcesses,
   getProcess,
   insertProcess,
   removeProcess,
@@ -13,15 +22,20 @@ export {
   deleteTemplate,
   getProcessHistory,
   getRecentHistory,
+  getHistoryByEvent,
+  getRecentHistoryByEvents,
   addHistoryEntry,
   getDependencyGraph,
   addDependency,
   removeDependency,
   getStartOrder,
+  retryDatabaseOperation,
   getDbInfo,
   dbPath,
   bgrHome,
   isProcessRunning,
+  isManagedProcessRunning,
+  findManagedProcessPid,
   terminateProcess,
   readFileTail,
   getProcessPorts,
@@ -45,6 +59,15 @@ export {
   syncProcessWatcher,
   getGuardRestartCounts,
   getRecentGuardEvents,
+  getErrorCode,
+  getErrorMessage,
+  hasErrorCode,
+  historyRowToGuardEvent,
+  parseGuardRestartMetadata,
+  TimeoutError,
+  retry,
+  withTimeout,
+  withTimeoutFallback,
   getVersion,
   calculateRuntime,
   parseEnvString,
@@ -60,5 +83,8 @@ export { deployProcess, deployAllProcesses } from "../../dist/deploy.js";
 export { buildDepGraph } from "../../dist/deps.js";
 export { rotateAllLogs } from "../../dist/log-rotation.js";
 
-export const guardEvents: any[] = [];
+import type { GuardEvent } from "../../dist/api.js";
+
+/** Backward-compatible placeholders; persistent guard analytics live in history. */
+export const guardEvents: GuardEvent[] = [];
 export const guardRestartCounts = new Map<string, number>();

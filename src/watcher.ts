@@ -1,8 +1,9 @@
 import { join } from "path";
 import {
   addHistoryEntry,
-  db,
+  getHistoryByEvent,
   getProcess,
+  getRecentHistoryByEvents,
   insertProcess,
   removeProcessByName,
   retryDatabaseOperation,
@@ -20,6 +21,11 @@ import {
 import { handleRun } from "./commands/run";
 import { shellQuoteArg } from "./cli-helpers";
 import { measureRequired, watcherMeasure as watcher } from "./observability";
+import { getErrorMessage } from "./error-utils";
+import {
+  historyRowToGuardEvent,
+  type GuardRestartReason,
+} from "./history-events";
 import {
   DEFAULT_GUARD_INTERVAL_MS,
   GUARD_STABILITY_WINDOW_MS,
@@ -36,8 +42,6 @@ import {
   stringifyEnvString,
 } from "./utils";
 
-type RestartReason = "crash" | "memory";
-
 type WatcherState = {
   restartCount: number;
   nextRestartAt: number;
@@ -47,7 +51,7 @@ type WatcherState = {
 
 type GuardInspection = {
   alive: boolean;
-  reason: RestartReason | null;
+  reason: GuardRestartReason | null;
   memoryBytes: number;
   memoryLimitMb: number;
 };
@@ -290,16 +294,16 @@ async function restartTarget(
       memoryBytes: inspection.memoryBytes || undefined,
       memoryLimitMb: inspection.memoryLimitMb || undefined,
     });
-  } catch (error: any) {
+  } catch (error: unknown) {
     addHistoryEntry(targetName, "guard_restart_failed", proc.pid, {
       by: watcherName,
       count: state.restartCount,
       backoffMs,
       reason: inspection.reason,
-      error: error?.message || String(error),
+      error: getErrorMessage(error),
     });
     console.error(
-      `[watcher] restart failed for "${targetName}": ${error?.message || error}`,
+      `[watcher] restart failed for "${targetName}": ${getErrorMessage(error)}`,
     );
   }
 }
@@ -353,42 +357,17 @@ export async function startProcessWatcher(
 
 export function getGuardRestartCounts() {
   const counts = new Map<string, number>();
-  const entries = db.history.select().where({ event: "guard_restart" }).all();
-  for (const entry of entries) {
+  for (const entry of getHistoryByEvent("guard_restart")) {
     counts.set(entry.process_name, (counts.get(entry.process_name) || 0) + 1);
   }
   return counts;
 }
 
 export function getRecentGuardEvents(limit = 100) {
-  const rows = db.history
-    .select()
-    .orderBy("timestamp", "desc")
-    .limit(limit * 4)
-    .all()
-    .filter(
-      (row: any) =>
-        row.event === "guard_restart" || row.event === "guard_restart_failed",
-    )
-    .slice(0, limit);
+  const rows = getRecentHistoryByEvents(
+    ["guard_restart", "guard_restart_failed"],
+    limit,
+  );
 
-  return rows.map((row: any) => {
-    let metadata: Record<string, any> = {};
-    try {
-      metadata = row.metadata ? JSON.parse(row.metadata) : {};
-    } catch {
-      metadata = {};
-    }
-
-    return {
-      time: new Date(row.timestamp).getTime(),
-      name: row.process_name,
-      action: "restart",
-      success: row.event === "guard_restart",
-      reason: metadata.reason,
-      memoryBytes: metadata.memoryBytes,
-      memoryLimitMb: metadata.memoryLimitMb,
-      backoffMs: metadata.backoffMs,
-    };
-  });
+  return rows.map(historyRowToGuardEvent);
 }
