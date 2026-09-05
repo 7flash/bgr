@@ -1,49 +1,68 @@
 /**
- * GET /api/next-port — Find the next available port
- *
- * Scans existing processes' env for PORT= values,
- * then returns the next unused port starting from a base (default 3001).
+ * GET /api/next-port — Find the next available TCP port.
  */
 import { getAllProcesses, parseCommandEnv } from "../../../lib/runtime";
 
+const DEFAULT_BASE_PORT = 3001;
+const MIN_PORT = 1;
+const MAX_PORT = 65535;
+
+function parseBasePort(raw: string | null): number | null {
+  if (raw == null || raw.trim() === "") return DEFAULT_BASE_PORT;
+  if (!/^\d+$/.test(raw.trim())) return null;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < MIN_PORT || value > MAX_PORT) {
+    return null;
+  }
+  return value;
+}
+
+function addPort(set: Set<number>, value: unknown) {
+  const port = Number(value);
+  if (Number.isInteger(port) && port >= MIN_PORT && port <= MAX_PORT) {
+    set.add(port);
+  }
+}
+
 export async function GET(req: Request) {
   const url = new URL(req.url);
-  const base = parseInt(url.searchParams.get("base") || "3001") || 3001;
+  const base = parseBasePort(url.searchParams.get("base"));
+  if (base == null) {
+    return Response.json(
+      { error: "base must be an integer between 1 and 65535" },
+      { status: 400 },
+    );
+  }
 
-  const processes = getAllProcesses();
   const usedPorts = new Set<number>();
-
-  for (const proc of processes) {
-    // Parse PORT/BUN_PORT from both stored env and inline command env.
+  for (const proc of getAllProcesses()) {
     const envStr = proc.env || "";
     const storedPortMatch = envStr.match(/(?:^|,)(?:PORT|BUN_PORT)=(\d+)/);
-    if (storedPortMatch) {
-      usedPorts.add(parseInt(storedPortMatch[1]));
-    }
+    if (storedPortMatch) addPort(usedPorts, storedPortMatch[1]);
 
     const commandEnv = parseCommandEnv(proc.command || "");
-    const commandPort = parseInt(
-      commandEnv.PORT || commandEnv.BUN_PORT || "",
-      10,
-    );
-    if (!isNaN(commandPort) && commandPort > 0) {
-      usedPorts.add(commandPort);
+    addPort(usedPorts, commandEnv.PORT || commandEnv.BUN_PORT || "");
+  }
+
+  for (let port = base; port <= MAX_PORT; port++) {
+    if (usedPorts.has(port)) continue;
+    if (!(await isPortInUse(port))) {
+      return Response.json({
+        port,
+        usedPorts: Array.from(usedPorts).sort((a, b) => a - b),
+      });
     }
   }
 
-  // Find next available port, skipping both registered and actually-bound ports
-  let nextPort = base;
-  while (usedPorts.has(nextPort) || (await isPortInUse(nextPort))) {
-    nextPort++;
-  }
-
-  return Response.json({
-    port: nextPort,
-    usedPorts: Array.from(usedPorts).sort((a, b) => a - b),
-  });
+  return Response.json(
+    { error: `No available port between ${base} and ${MAX_PORT}` },
+    { status: 503 },
+  );
 }
 
 async function isPortInUse(port: number): Promise<boolean> {
+  if (!Number.isInteger(port) || port < MIN_PORT || port > MAX_PORT)
+    return true;
   try {
     const server = Bun.serve({
       port,

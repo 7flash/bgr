@@ -6,17 +6,9 @@ import {
   removeAllProcesses,
   updateProcessPid,
 } from "../db";
-import {
-  isProcessRunning,
-  terminateProcess,
-  getProcessPorts,
-  killProcessOnPort,
-  waitForPortFree,
-  isPortFree,
-} from "../platform";
+import { isManagedProcessRunning, terminateProcess } from "../platform";
 import {
   parseEnvString,
-  getDeclaredPort,
   acquireProcessOperationLock,
   getWatchedProcessName,
   isInternalProcessName,
@@ -43,7 +35,11 @@ export async function handleDelete(name: string) {
     return;
   }
 
-  const isRunning = await isProcessRunning(process.pid, process.command);
+  const isRunning = await isManagedProcessRunning(
+    process.pid,
+    name,
+    process.command,
+  );
   if (isRunning) {
     await terminateProcess(process.pid);
   }
@@ -76,7 +72,11 @@ export async function handleClean() {
   let deletedLogs = 0;
 
   for (const proc of processes) {
-    const running = await isProcessRunning(proc.pid, proc.command);
+    const running = await isManagedProcessRunning(
+      proc.pid,
+      proc.name,
+      proc.command,
+    );
     if (!running) {
       const watched = getWatchedProcessName(proc.name);
       if (watched) {
@@ -133,7 +133,11 @@ export async function handleStop(name: string, seen: Set<string> = new Set()) {
       stoppedChildren++;
     }
 
-    const isRunning = await isProcessRunning(proc.pid, proc.command);
+    const isRunning = await isManagedProcessRunning(
+      proc.pid,
+      name,
+      proc.command,
+    );
     if (!isRunning) {
       updateProcessPid(name, 0);
       announce(
@@ -143,31 +147,10 @@ export async function handleStop(name: string, seen: Set<string> = new Set()) {
       return;
     }
 
-    // Detect ports the process is using BEFORE killing it
-    const ports = await getProcessPorts(proc.pid);
-
+    // Stop only the registered, command-verified PID. Never kill by port:
+    // another service (for example Caddy) may legitimately connect to or later
+    // own that port.
     await terminateProcess(proc.pid);
-
-    // Also kill by detected ports as safety net
-    for (const port of ports) {
-      await killProcessOnPort(port);
-    }
-
-    // Also clean up the declared port if one exists.
-    // This is critical when the stored PID is dead (e.g., cmd.exe wrapper died)
-    // but the orphaned child (bun.exe) is still holding the port.
-    const procEnv = proc.env ? parseEnvString(proc.env) : {};
-    const declaredPort = getDeclaredPort(procEnv, proc.command);
-    if (declaredPort && !ports.includes(declaredPort)) {
-      const portFree = await isPortFree(declaredPort);
-      if (!portFree) {
-        console.log(
-          `[stop] Declared port ${declaredPort} is busy (orphaned process), cleaning up...`,
-        );
-        await killProcessOnPort(declaredPort);
-        await waitForPortFree(declaredPort, 3000);
-      }
-    }
 
     // Mark PID as 0 — prevents reconcileProcessPids from re-attaching
     // a random matching process as this one
@@ -190,47 +173,21 @@ export async function handleDeleteAll() {
   }
 
   let killedCount = 0;
-  let portsFreed = 0;
 
   for (const proc of processes) {
     if (!isInternalProcessName(proc.name)) {
       await stopProcessWatcher(proc.name);
     }
-    const running = await isProcessRunning(proc.pid, proc.command);
+    const running = await isManagedProcessRunning(
+      proc.pid,
+      proc.name,
+      proc.command,
+    );
 
     if (running) {
-      // Detect ports BEFORE killing so we can clean them up
-      const ports = await getProcessPorts(proc.pid);
-
-      // Force-kill the process tree
+      // Force-kill only the registered, command-verified process tree.
       await terminateProcess(proc.pid, true);
       killedCount++;
-
-      // Kill anything still holding the ports
-      for (const port of ports) {
-        await killProcessOnPort(port);
-        const freed = await waitForPortFree(port, 3000);
-        if (!freed) {
-          await killProcessOnPort(port);
-          await waitForPortFree(port, 2000);
-        }
-        portsFreed++;
-      }
-    }
-
-    // Also clean up the declared port if one exists (handles orphaned processes)
-    const procEnv = proc.env ? parseEnvString(proc.env) : {};
-    const declaredPort = getDeclaredPort(procEnv, proc.command);
-    if (declaredPort) {
-      const portFree = await isPortFree(declaredPort);
-      if (!portFree) {
-        console.log(
-          `[nuke] Declared port ${declaredPort} is busy, cleaning up...`,
-        );
-        await killProcessOnPort(declaredPort);
-        const freed = await waitForPortFree(declaredPort, 3000);
-        if (freed) portsFreed++;
-      }
     }
 
     // Clean up log files
@@ -252,8 +209,6 @@ export async function handleDeleteAll() {
     `${processes.length} ${processes.length === 1 ? "process" : "processes"} deleted`,
   ];
   if (killedCount > 0) parts.push(`${killedCount} force-killed`);
-  if (portsFreed > 0)
-    parts.push(`${portsFreed} ${portsFreed === 1 ? "port" : "ports"} freed`);
 
   announce(parts.join(", ") + ".", "Nuke Complete");
 }

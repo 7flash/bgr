@@ -1,13 +1,15 @@
-/**
- * GET /api/debug — Debug info about BGR internals
- *
- * Returns DB path, BGR home dir, platform info for diagnostics.
- */
+/** GET /api/debug — diagnostic information about the current bgrun runtime. */
 import { getDbInfo } from "../../../lib/runtime";
-import { measureSync } from "measure-fn";
+import { apiMeasure as api } from "../../../lib/observability";
 
 export async function GET() {
-  const info = measureSync("DB info", () => getDbInfo());
+  const info = (await api.measure("DB info", () => getDbInfo())) ?? {
+    dbPath: null,
+    bgrHome: null,
+    dbFilename: null,
+    exists: false,
+  };
+
   return Response.json({
     ...info,
     platform: process.platform,

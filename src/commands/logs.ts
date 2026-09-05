@@ -22,11 +22,10 @@ type FollowTarget = {
 
 function outputHeader(
   label: string,
-  name: string,
+  _name: string,
   color: (value: string) => string,
 ) {
-  console.log(color(`📄 ${label} logs for ${name}:`));
-  console.log(chalk.gray("═".repeat(50)));
+  console.log(color(`[${label.toLowerCase()}]`));
 }
 
 function fileSize(path: string): number {
@@ -163,7 +162,7 @@ export async function showLogs(
       });
     }
 
-    if (logType === "both") console.log("\n");
+    if (logType === "both") console.log("");
   }
 
   if (logType === "both" || logType === "stderr") {
@@ -182,7 +181,7 @@ export async function showLogs(
 
   if (!follow) return;
 
-  console.log(chalk.gray("\nFollowing logs. Press Ctrl+C to stop.\n"));
+  console.log(chalk.gray("following logs; Ctrl+C to stop"));
 
   const stopFns = targets.map((target) =>
     startFollowing(target, Math.max(50, options.pollMs ?? 250)),

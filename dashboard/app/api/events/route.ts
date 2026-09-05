@@ -1,63 +1,47 @@
-/**
- * GET /api/events — Server-Sent Events endpoint
- *
- * Streams process data every 3 seconds. Replaces client-side polling.
- * The client connects once via EventSource and receives updates automatically.
- *
- * Delegates to /api/processes for data enrichment (including PID reconciliation).
- */
+/** GET /api/events — shared-cache Server-Sent Events process stream. */
+import { getProcessSnapshots } from "../../../lib/process-store";
 
-const INTERVAL_MS = 3_000;
+const INTERVAL_MS = 5_000;
+const KEEPALIVE_MS = 15_000;
 
-export async function GET(req: Request) {
-  const url = new URL(req.url);
-  const origin = url.origin; // e.g. http://localhost:3001
-
+export async function GET(_req: Request) {
   const encoder = new TextEncoder();
+  let closed = false;
+  let interval: ReturnType<typeof setInterval> | null = null;
+  let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
 
   const stream = new ReadableStream({
     async start(controller) {
-      // Send initial data immediately
-      try {
-        const res = await fetch(`${origin}/api/processes?t=${Date.now()}`);
-        const data = await res.json();
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
-      } catch {
-        controller.enqueue(encoder.encode(`data: []\n\n`));
-      }
-
-      // Periodic keepalive to prevent proxy/browser timeouts
-      const keepaliveInterval = setInterval(() => {
+      const enqueue = (value: string) => {
+        if (closed) return;
         try {
-          controller.enqueue(encoder.encode(`: keepalive\n\n`));
+          controller.enqueue(encoder.encode(value));
         } catch {
-          /* stream closed */
+          closed = true;
         }
-      }, 15_000);
-
-      // Then send updates every INTERVAL_MS
-      const interval = setInterval(async () => {
-        try {
-          const res = await fetch(`${origin}/api/processes?t=${Date.now()}`);
-          const data = await res.json();
-          controller.enqueue(
-            encoder.encode(`data: ${JSON.stringify(data)}\n\n`),
-          );
-        } catch {
-          // Skip this tick, send on next
-        }
-      }, INTERVAL_MS);
-
-      // Store cleanup for when the stream is cancelled
-      (stream as any).__cleanup = () => {
-        clearInterval(interval);
-        clearInterval(keepaliveInterval);
       };
+
+      const sendProcesses = async () => {
+        if (closed) return;
+        try {
+          const data = await getProcessSnapshots();
+          enqueue(`data: ${JSON.stringify(data)}\n\n`);
+        } catch {
+          // Keep the stream alive across transient OS/DB sampling failures.
+        }
+      };
+
+      await sendProcesses();
+      interval = setInterval(() => void sendProcesses(), INTERVAL_MS);
+      keepaliveInterval = setInterval(
+        () => enqueue(": keepalive\n\n"),
+        KEEPALIVE_MS,
+      );
     },
     cancel() {
-      if ((stream as any).__cleanup) {
-        (stream as any).__cleanup();
-      }
+      closed = true;
+      if (interval) clearInterval(interval);
+      if (keepaliveInterval) clearInterval(keepaliveInterval);
     },
   });
 

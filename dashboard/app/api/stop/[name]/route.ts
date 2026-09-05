@@ -1,58 +1,46 @@
-/**
- * POST /api/stop/:name — Stop a running process
- *
- * Kills the registered PID, then kills anything remaining on the port.
- * Sets PID to 0 to prevent reconciliation from hijacking unrelated processes.
- */
+/** POST /api/stop/:name — stop the registered PID only. */
 import {
-  getProcess,
-  updateProcessPid,
   addHistoryEntry,
-} from "../../../../lib/runtime";
-import {
+  getProcess,
   isProcessRunning,
   terminateProcess,
-  getProcessPorts,
-  killProcessOnPort,
+  updateProcessPid,
 } from "../../../../lib/runtime";
-import { measure } from "measure-fn";
+import {
+  apiMeasure as api,
+  measureRequired,
+} from "../../../../lib/observability";
 
 export async function POST(
-  req: Request,
+  _req: Request,
   { params }: { params: { name: string } },
 ) {
   const name = decodeURIComponent(params.name);
   const proc = getProcess(name);
-
   if (!proc) {
     return Response.json({ error: "Process not found" }, { status: 404 });
   }
 
-  const running = await isProcessRunning(proc.pid);
-  if (!running) {
-    // Already dead — mark PID as 0 to prevent reconciliation
+  try {
+    const running = await isProcessRunning(proc.pid, proc.command);
+    if (!running) {
+      updateProcessPid(name, 0);
+      return Response.json({ success: true, already_stopped: true });
+    }
+
+    await measureRequired(
+      api.measure,
+      `Stop process "${name}" pid=${proc.pid}`,
+      () => terminateProcess(proc.pid),
+    );
+
     updateProcessPid(name, 0);
-    return Response.json({ success: true, already_stopped: true });
+    addHistoryEntry(name, "stop", proc.pid);
+    return Response.json({ success: true });
+  } catch (error: any) {
+    return Response.json(
+      { error: error?.message || String(error) },
+      { status: 500 },
+    );
   }
-
-  // Detect ports BEFORE killing so we can clean them up
-  const ports = await getProcessPorts(proc.pid);
-
-  await measure(`Stop "${name}" (PID ${proc.pid})`, () =>
-    terminateProcess(proc.pid),
-  );
-
-  // Also kill anything still on the ports
-  for (const port of ports) {
-    await killProcessOnPort(port);
-  }
-
-  // Mark PID as 0 — prevents reconcileProcessPids from re-attaching
-  // a random matching process as this one
-  updateProcessPid(name, 0);
-
-  // Record history
-  addHistoryEntry(name, "stop", proc.pid);
-
-  return Response.json({ success: true });
 }

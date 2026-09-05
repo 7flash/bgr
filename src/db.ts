@@ -160,7 +160,7 @@ export function removeProcessByName(name: string) {
 
 /** Update the stored PID for a process (used by PID reconciliation) */
 export function updateProcessPid(name: string, newPid: number) {
-  const proc = db.process.select().where({ name }).limit(1).get();
+  const proc = getProcess(name);
   if (proc) {
     proc.update({ pid: newPid });
   }
@@ -175,7 +175,7 @@ export function removeAllProcesses() {
 
 /** Update the stored env JSON for a process (used by guard toggle) */
 export function updateProcessEnv(name: string, envJson: string) {
-  const proc = db.process.select().where({ name }).limit(1).get();
+  const proc = getProcess(name);
   if (proc) {
     proc.update({ env: envJson });
   }

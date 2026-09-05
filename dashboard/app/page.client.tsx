@@ -27,6 +27,20 @@ interface ProcessData {
   memoryHistory?: number[];
 }
 
+function escapeHtml(value: unknown): string {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// Safe for values placed inside quoted HTML/SVG attributes.
+function escapeHtmlAttr(value: unknown): string {
+  return escapeHtml(value).replace(/`/g, "&#96;");
+}
+
 // ─── SVG Icon Helpers ───
 
 function SvgIcon({ d, className }: { d: string; className?: string }) {
@@ -910,6 +924,10 @@ export default function mount(): () => void {
     name: string;
     action: string;
     success: boolean;
+    reason?: "crash" | "memory" | string;
+    memoryBytes?: number;
+    memoryLimitMb?: number;
+    backoffMs?: number;
   }
 
   async function loadGuardEvents() {
@@ -934,7 +952,13 @@ export default function mount(): () => void {
             second: "2-digit",
           });
           const icon = ev.success ? "↻" : "✕";
-          const actionText = ev.action === "restart" ? "restarted" : ev.action;
+          let actionText = ev.action === "restart" ? "restarted" : ev.action;
+          if (ev.reason === "memory" && ev.memoryBytes && ev.memoryLimitMb) {
+            const usedMb = Math.round(ev.memoryBytes / (1024 * 1024));
+            actionText += ` · memory ${usedMb}/${Math.round(ev.memoryLimitMb)} MB`;
+          } else if (ev.reason) {
+            actionText += ` · ${ev.reason}`;
+          }
           return (
             <div className={`guard-event ${ev.success ? "success" : "failed"}`}>
               <span className="guard-event-time">{timeStr}</span>
@@ -1799,7 +1823,7 @@ export default function mount(): () => void {
     envEl.innerHTML = pairs
       .map(
         ([k, v]) =>
-          `<div class="env-row"><span class="env-key" title="${k}">${k}</span><span class="env-value">${v}</span></div>`,
+          `<div class="env-row"><span class="env-key" title="${escapeHtmlAttr(k)}">${escapeHtml(k)}</span><span class="env-value">${escapeHtml(v)}</span></div>`,
       )
       .join("");
   }
@@ -2223,7 +2247,7 @@ export default function mount(): () => void {
         const parts: string[] = [];
         if (data.filePath) {
           parts.push(
-            `<span style="color:var(--text-dim)" title="${data.filePath}">${data.filePath}</span>`,
+            `<span style="color:var(--text-dim)" title="${escapeHtmlAttr(data.filePath)}">${escapeHtml(data.filePath)}</span>`,
           );
         }
         if (data.mtime) {
@@ -2679,7 +2703,7 @@ export default function mount(): () => void {
       const val = sel.value;
       sel.innerHTML = `<option value="">Select process...</option>`;
       for (const name of names) {
-        sel.innerHTML += `<option value="${name}">${name}</option>`;
+        sel.innerHTML += `<option value="${escapeHtmlAttr(name)}">${escapeHtml(name)}</option>`;
       }
       sel.value = val;
     }
@@ -2809,7 +2833,7 @@ export default function mount(): () => void {
         const y2 = to.y + nodeH / 2;
         const cx1 = x1 + (x2 - x1) * 0.4;
         const cx2 = x2 - (x2 - x1) * 0.4;
-        svgContent += `<path class="deps-edge" d="M${x1},${y1} C${cx1},${y1} ${cx2},${y2} ${x2},${y2}" data-from="${dep}" data-to="${proc}" />`;
+        svgContent += `<path class="deps-edge" d="M${x1},${y1} C${cx1},${y1} ${cx2},${y2} ${x2},${y2}" data-from="${escapeHtmlAttr(dep)}" data-to="${escapeHtmlAttr(proc)}" />`;
       }
     }
 
@@ -2827,10 +2851,10 @@ export default function mount(): () => void {
       const statusDot = isRunning ? "🟢" : "⚫";
 
       svgContent += `
-                <g class="deps-node" data-name="${name}">
+                <g class="deps-node" data-name="${escapeHtmlAttr(name)}">
                     <rect x="${pos.x}" y="${pos.y}" width="${nodeW}" height="${nodeH}" 
                           fill="${fillColor}" stroke="${strokeColor}" />
-                    <text x="${pos.x + 22}" y="${pos.y + nodeH / 2 + 4}" font-size="11">${name.length > 14 ? name.slice(0, 13) + "…" : name}</text>
+                    <text x="${pos.x + 22}" y="${pos.y + nodeH / 2 + 4}" font-size="11">${escapeHtml(name.length > 14 ? name.slice(0, 13) + "…" : name)}</text>
                     <text x="${pos.x + 6}" y="${pos.y + nodeH / 2 + 5}" font-size="10">${statusDot}</text>
                 </g>
             `;
@@ -2880,10 +2904,10 @@ export default function mount(): () => void {
       .map(
         (e) => `
             <div class="deps-list-item">
-                <span class="deps-item-process">${e.process}</span>
+                <span class="deps-item-process">${escapeHtml(e.process)}</span>
                 <span class="deps-item-arrow">→ depends on →</span>
-                <span class="deps-item-target">${e.dep}</span>
-                <button class="deps-remove-btn" data-process="${e.process}" data-dep="${e.dep}" title="Remove dependency">✕</button>
+                <span class="deps-item-target">${escapeHtml(e.dep)}</span>
+                <button class="deps-remove-btn" data-process="${escapeHtmlAttr(e.process)}" data-dep="${escapeHtmlAttr(e.dep)}" title="Remove dependency">✕</button>
             </div>
         `,
       )
@@ -2921,7 +2945,7 @@ export default function mount(): () => void {
                     (name, i) => `
                     <span class="deps-order-badge">
                         <span class="deps-order-num">${i + 1}</span>
-                        ${name}
+                        ${escapeHtml(name)}
                     </span>
                 `,
                   )
@@ -4052,7 +4076,7 @@ export default function mount(): () => void {
         (r) => r.phase === "pending",
       ).length;
       const scope = latestDeploySummary.group
-        ? `Group: ${latestDeploySummary.group}`
+        ? `Group: ${escapeHtml(latestDeploySummary.group)}`
         : "All deployable processes";
       summaryEl.innerHTML = [
         `<span><strong>${scope}</strong></span>`,

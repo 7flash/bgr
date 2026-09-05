@@ -7,9 +7,7 @@ import * as fs from "fs";
 import * as os from "os";
 import { join } from "path";
 import { $ } from "bun";
-import { measure, createMeasure } from "measure-fn";
-
-const plat = createMeasure("platform");
+import { measureRequired, platformMeasure as plat } from "./observability";
 
 // Simple LRU cache for process liveness checks to avoid repeated PowerShell queries
 const isRunningCache = new Map<string, { alive: boolean; checkedAt: number }>();
@@ -217,12 +215,16 @@ export async function psExec(
       },
     );
 
-    // Race the process against the timeout
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
     const timeoutPromise = new Promise<string>((_, reject) => {
-      setTimeout(
-        () => reject(new Error("PowerShell command timed out")),
-        timeoutMs,
-      );
+      timeoutHandle = setTimeout(() => {
+        try {
+          proc.kill();
+        } catch {
+          // Process may already have exited.
+        }
+        reject(new Error("PowerShell command timed out"));
+      }, timeoutMs);
     }) as Promise<string>;
 
     const resultPromise = new Promise<string>(async (resolve, reject) => {
@@ -246,12 +248,15 @@ export async function psExec(
       }
     });
 
-    // Wait for either the process to complete or the timeout
+    // Wait for either the process to complete or the timeout. Always clear the
+    // timer; on timeout the spawned PowerShell process is terminated above.
     try {
       const result = await Promise.race([resultPromise, timeoutPromise]);
-      return result.trim(); // Trim to remove trailing newline
-    } catch (error) {
-      return ""; // Return empty string on timeout or error
+      return result.trim();
+    } catch {
+      return "";
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
     }
   } catch {
     return "";
@@ -290,7 +295,7 @@ export async function isProcessRunning(
   }
 
   return (
-    (await plat.measure(`PID ${pid} alive?`, async () => {
+    (await plat.measure(`Process alive pid=${pid}`, async () => {
       try {
         // Docker container detection
         if (
@@ -347,6 +352,23 @@ export async function isProcessRunning(
       }
     })) ?? false
   );
+}
+
+/** Verify that a live PID is the exact bgrun-managed process name. */
+export async function isManagedProcessRunning(
+  pid: number,
+  processName: string,
+  command?: string,
+): Promise<boolean> {
+  if (!(await isProcessRunning(pid, command))) return false;
+  if (isWindows()) return true;
+
+  try {
+    const environ = fs.readFileSync(`/proc/${pid}/environ`, "utf8");
+    return environ.includes(`BGR_PROCESS_NAME=${processName}\0`);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -421,36 +443,39 @@ export async function terminateProcess(
   pid: number,
   force: boolean = false,
 ): Promise<void> {
-  await plat.measure(`Terminate PID ${pid}`, async (m) => {
-    try {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+
+  clearProcessRunningCache(pid);
+  await measureRequired(
+    plat.measure,
+    `Terminate process pid=${pid}${force ? " force" : ""}`,
+    async (m) => {
       if (isWindows()) {
-        // Always use /T (tree kill) on Windows to kill the entire process tree
-        // This prevents grandchild processes from surviving as zombies
         await $`taskkill /F /T /PID ${pid}`.nothrow().quiet();
       } else {
-        // On Unix, kill children first, then parent
         const children =
-          (await m("Get children", () => getChildPids(pid))) ?? [];
+          ((await m?.("Get children", () => getChildPids(pid))) as
+            number[] | null | undefined) ?? [];
         const signal = force ? "KILL" : "TERM";
-        for (const childPid of children) {
-          try {
-            await $`kill -${signal} ${childPid}`.nothrow();
-          } catch {
-            /* already dead */
-          }
-        }
-        await Bun.sleep(500);
-        if (await isProcessRunning(pid)) {
-          await $`kill -${signal} ${pid}`.nothrow();
-        }
-      }
-    } catch {
-      // Ignore errors for already-dead processes
-    }
 
-    // Wait for process to fully exit
-    await Bun.sleep(300);
-  });
+        for (const childPid of children) {
+          await $`kill -${signal} ${childPid}`.nothrow().quiet();
+        }
+        await $`kill -${signal} ${pid}`.nothrow().quiet();
+      }
+
+      await Bun.sleep(force ? 150 : 500);
+      clearProcessRunningCache(pid);
+      if (!(await isProcessRunning(pid))) return;
+
+      // Do not escalate a graceful stop by PID alone: after a PID exits the OS
+      // can reuse it, and a blind second signal could target another process.
+      // Callers that have already verified ownership can request force=true.
+      if (await isProcessRunning(pid)) {
+        throw new Error(`PID ${pid} did not exit`);
+      }
+    },
+  );
 }
 
 /**
@@ -575,59 +600,48 @@ export async function waitForPortFree(
  * since taskkill can't kill those — they require a reboot or TCP stack reset.
  */
 export async function killProcessOnPort(port: number): Promise<void> {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return;
+
   try {
+    const pids = new Set<number>();
+
     if (isWindows()) {
-      // On Windows, use netstat to find processes on port
-      const result = await $`netstat -ano | findstr :${port}`
+      // Only kill PIDs that are LISTENING on the exact local port.
+      // Never match ESTABLISHED/remote connections: doing so can kill reverse
+      // proxies such as Caddy that merely connect to the managed app port.
+      const result = await $`netstat -ano`.nothrow().quiet().text();
+      for (const line of result.split("\n")) {
+        const match = line.match(
+          /^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$/,
+        );
+        if (!match || Number(match[1]) !== port) continue;
+        const pid = Number(match[2]);
+        if (Number.isInteger(pid) && pid > 0) pids.add(pid);
+      }
+    } else {
+      // Listener-only. `lsof -ti :PORT` also returns client connections and can
+      // therefore select Caddy/nginx/other unrelated processes.
+      const result = await $`lsof -nP -tiTCP:${port} -sTCP:LISTEN`
         .nothrow()
         .quiet()
         .text();
-      const pids = new Set<number>();
-
-      for (const line of result.split("\n")) {
-        // Match exact port — avoid :35560 matching :3556
-        // Match any state (LISTENING, ESTABLISHED, TIME_WAIT, etc.)
-        const match = line.match(
-          new RegExp(`:(${port})\\s+.*?\\s+(\\d+)\\s*$`),
-        );
-        if (match && parseInt(match[1]) === port) {
-          const pid = parseInt(match[2]);
-          if (pid > 0) pids.add(pid);
-        }
-      }
-
-      for (const pid of pids) {
-        // Check if the process actually exists before trying to kill it
-        // This avoids the zombie PID issue where sockets linger after process death
-        const alive = await isProcessRunning(pid);
-        if (alive) {
-          await $`taskkill /F /T /PID ${pid}`.nothrow().quiet();
-          console.log(`Killed process ${pid} using port ${port}`);
-        } else {
-          // Zombie socket — PID no longer exists but socket lingers in kernel
-          console.warn(
-            `⚠ Port ${port} held by zombie PID ${pid} (process dead, socket stuck in kernel). Will clear on reboot or TCP timeout.`,
-          );
-        }
-      }
-    } else {
-      // On Unix, use lsof
-      const result = await $`lsof -ti :${port}`.nothrow().text();
-      if (result.trim()) {
-        const pids = result
-          .trim()
-          .split("\n")
-          .filter((pid) => pid);
-        for (const pid of pids) {
-          await $`kill -9 ${pid}`.nothrow();
-          console.log(`Killed process ${pid} using port ${port}`);
-        }
+      for (const line of result.trim().split(/\r?\n/)) {
+        const pid = Number(line.trim());
+        if (Number.isInteger(pid) && pid > 0) pids.add(pid);
       }
     }
-  } catch (error) {
-    console.warn(
-      `Warning: Could not check or kill process on port ${port}: ${error}`,
-    );
+
+    for (const pid of pids) {
+      if (!(await isProcessRunning(pid))) continue;
+      if (isWindows()) {
+        await $`taskkill /F /T /PID ${pid}`.nothrow().quiet();
+      } else {
+        await $`kill -KILL ${pid}`.nothrow().quiet();
+      }
+    }
+  } catch {
+    // Best-effort helper. Callers must not treat port ownership as proof that a
+    // process belongs to bgrun.
   }
 }
 
@@ -697,6 +711,47 @@ export async function findChildPid(parentPid: number): Promise<number> {
 }
 
 /**
+ * Find a live bgrun-managed process by the exact BGR_PROCESS_NAME marker.
+ * This is intentionally supported on Unix only, where /proc exposes the
+ * inherited environment and cwd without heuristic command matching.
+ */
+export async function findManagedProcessPid(
+  processName: string,
+  command?: string,
+  workdir?: string,
+): Promise<number | null> {
+  if (!processName || isWindows()) return null;
+
+  try {
+    const marker = `BGR_PROCESS_NAME=${processName}\0`;
+    const candidates: number[] = [];
+    const entries = fs
+      .readdirSync("/proc", { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && /^\d+$/.test(entry.name));
+
+    for (const entry of entries) {
+      const pid = Number(entry.name);
+      if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue;
+
+      try {
+        const environ = fs.readFileSync(`/proc/${pid}/environ`, "utf8");
+        if (!environ.includes(marker)) continue;
+        if (workdir && fs.readlinkSync(`/proc/${pid}/cwd`) !== workdir)
+          continue;
+        if (command && !(await isProcessRunning(pid, command))) continue;
+        candidates.push(pid);
+      } catch {
+        // Process exited or is not inspectable.
+      }
+    }
+
+    return candidates.length === 1 ? candidates[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Reconcile stale PIDs: when a stored PID is dead, search for a live process
  * matching the same command line and update the DB with the correct PID.
  *
@@ -714,106 +769,22 @@ export async function reconcileProcessPids(
   }>,
   deadPids: Set<number>,
 ): Promise<Map<string, number>> {
-  return (
-    (await plat.measure("Reconcile PIDs", async () => {
-      const result = new Map<string, number>();
-      // Skip processes with PID=0 — these were intentionally stopped
-      // and should NOT be reconciled to avoid hijacking unrelated processes
-      const needsReconciliation = processes.filter(
-        (p) => deadPids.has(p.pid) && p.pid > 0,
-      );
-      if (needsReconciliation.length === 0) return result;
+  const result = new Map<string, number>();
 
-      try {
-        // Get all running processes with their command lines
-        let runningProcs: Array<{ pid: number; cmdLine: string }> = [];
+  // Never globally score "similar" commands. Reconcile only when the exact
+  // bgrun process-name marker proves identity. On Windows this intentionally
+  // returns no matches; a stale row is safer than a guessed PID.
+  for (const proc of processes) {
+    if (proc.pid <= 0 || !deadPids.has(proc.pid)) continue;
+    const pid = await findManagedProcessPid(
+      proc.name,
+      proc.command,
+      proc.workdir,
+    );
+    if (pid) result.set(proc.name, pid);
+  }
 
-        if (isWindows()) {
-          const output = await psExec(
-            `Get-CimInstance Win32_Process -Filter "Name='bun.exe'" | ForEach-Object { Write-Output "$($_.ProcessId)|$($_.CommandLine)" }`,
-            2000,
-          );
-          for (const line of output.split("\n")) {
-            const sepIdx = line.indexOf("|");
-            if (sepIdx === -1) continue;
-            const pid = parseInt(line.substring(0, sepIdx).trim());
-            const cmdLine = line.substring(sepIdx + 1).trim();
-            if (!isNaN(pid) && pid > 0 && cmdLine) {
-              runningProcs.push({ pid, cmdLine });
-            }
-          }
-        } else {
-          const psOutput = await $`ps -eo pid,args --no-headers`
-            .nothrow()
-            .quiet()
-            .text();
-          for (const line of psOutput.trim().split("\n")) {
-            const match = line.trim().match(/^(\d+)\s+(.+)/);
-            if (match) {
-              runningProcs.push({ pid: parseInt(match[1]), cmdLine: match[2] });
-            }
-          }
-        }
-
-        // For each dead process, try to find a matching live process
-        // Uses multi-criteria scoring to avoid false matches when multiple
-        // processes share similar commands (e.g. "bun run server.ts")
-        for (const proc of needsReconciliation) {
-          const cmdParts = proc.command.split(/\s+/);
-          // Extract meaningful parts: full command and workdir path segments
-          const workdirParts = proc.workdir
-            .replace(/\\/g, "/")
-            .split("/")
-            .filter(Boolean);
-          const workdirLast =
-            workdirParts[workdirParts.length - 1]?.toLowerCase() || "";
-
-          let bestMatch: { pid: number; score: number } | null = null;
-          let ambiguous = false;
-
-          for (const running of runningProcs) {
-            const cmdLower = running.cmdLine.toLowerCase();
-            let score = 0;
-
-            // Score 1: command parts match (e.g. "run", "server.ts")
-            for (const part of cmdParts) {
-              if (part.length > 2 && cmdLower.includes(part.toLowerCase()))
-                score++;
-            }
-
-            // Score 2: workdir folder name appears in command line path
-            // This distinguishes "bun run server.ts" in different directories
-            if (workdirLast && cmdLower.includes(workdirLast)) score += 3;
-
-            // Score 3: full workdir path match (strongest signal)
-            if (
-              cmdLower.includes(proc.workdir.toLowerCase().replace(/\\/g, "/"))
-            )
-              score += 5;
-            if (cmdLower.includes(proc.workdir.toLowerCase())) score += 5;
-
-            if (score < 4) continue; // Require workdir evidence — generic cmd matches alone aren't enough
-
-            if (!bestMatch || score > bestMatch.score) {
-              ambiguous = false;
-              bestMatch = { pid: running.pid, score };
-            } else if (score === bestMatch.score) {
-              ambiguous = true; // Multiple equally good matches — skip
-            }
-          }
-
-          if (bestMatch && !ambiguous) {
-            result.set(proc.name, bestMatch.pid);
-            runningProcs = runningProcs.filter((p) => p.pid !== bestMatch!.pid);
-          }
-        }
-      } catch {
-        // Reconciliation is best-effort — return partial results
-      }
-
-      return result;
-    })) ?? new Map()
-  );
+  return result;
 }
 
 /**
@@ -825,45 +796,36 @@ export async function findPidByPort(
   port: number,
   maxWaitMs = 8000,
 ): Promise<number | null> {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+
   const start = Date.now();
-  const pollMs = 500;
+  const pollMs = 250;
 
   while (Date.now() - start < maxWaitMs) {
     try {
       if (isWindows()) {
         const result = await $`netstat -ano`.nothrow().quiet().text();
         for (const line of result.split("\n")) {
-          if (line.includes(`:${port}`) && line.includes("LISTENING")) {
-            const parts = line.trim().split(/\s+/);
-            const pid = parseInt(parts[parts.length - 1]);
-            if (!isNaN(pid) && pid > 0) return pid;
-          }
+          const match = line.match(
+            /^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$/,
+          );
+          if (!match || Number(match[1]) !== port) continue;
+          const pid = Number(match[2]);
+          if (Number.isInteger(pid) && pid > 0) return pid;
         }
       } else {
-        try {
-          const result = await $`ss -tlnp`.nothrow().quiet().text();
-          for (const line of result.split("\n")) {
-            if (line.includes(`:${port}`)) {
-              const pidMatch = line.match(/pid=(\d+)/);
-              if (pidMatch) return parseInt(pidMatch[1]);
-            }
-          }
-        } catch {
-          /* ss not available, try lsof */
-        }
-
-        const result = await $`lsof -iTCP:${port} -sTCP:LISTEN -t`
+        const result = await $`lsof -nP -tiTCP:${port} -sTCP:LISTEN`
           .nothrow()
           .quiet()
           .text();
-        const pid = parseInt(result.trim());
-        if (!isNaN(pid) && pid > 0) return pid;
+        const pid = Number(result.trim().split(/\r?\n/)[0]);
+        if (Number.isInteger(pid) && pid > 0) return pid;
       }
     } catch {
       /* retry */
     }
 
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
+    await Bun.sleep(pollMs);
   }
 
   return null;
@@ -874,7 +836,7 @@ export async function readFileTail(
   lines?: number,
 ): Promise<string> {
   return (
-    (await plat.measure(`Read tail ${lines ?? "all"}L`, async () => {
+    (await plat.measure(`Read log tail lines=${lines ?? "all"}`, async () => {
       try {
         const content = await Bun.file(filePath).text();
 
@@ -922,7 +884,7 @@ export async function getProcessBatchResources(
   if (pids.length === 0) return new Map();
 
   return (
-    (await plat.measure(`Batch resources (${pids.length} PIDs)`, async () => {
+    (await plat.measure(`Batch resources count=${pids.length}`, async () => {
       const resourceMap = new Map<number, { memory: number; cpu: number }>();
       const pidSet = new Set(pids);
 

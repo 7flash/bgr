@@ -1,37 +1,39 @@
-/**
- * POST /api/start — Create or start a process
- */
-import { handleRun } from "../../../lib/runtime";
-import { addHistoryEntry } from "../../../lib/runtime";
-import { measure } from "measure-fn";
+/** POST /api/start — create or start a process. */
+import { addHistoryEntry, handleRun } from "../../../lib/runtime";
+import { apiMeasure as api, measureRequired } from "../../../lib/observability";
 
 export async function POST(req: Request) {
-  const body = await req.json();
-
   try {
-    // Build env from body.env object if provided (e.g. { PORT: "3001" })
+    const body = await req.json();
+    const name = typeof body?.name === "string" ? body.name.trim() : "";
+    if (!name) {
+      return Response.json({ error: "name is required" }, { status: 400 });
+    }
+
     const env =
-      body.env && typeof body.env === "object"
+      body.env && typeof body.env === "object" && !Array.isArray(body.env)
         ? (body.env as Record<string, string>)
         : undefined;
 
-    await measure(`Start process "${body.name}"`, () =>
+    await measureRequired(api.measure, `Start process "${name}"`, () =>
       handleRun({
         action: "run",
-        name: body.name,
-        command: body.command,
-        directory: body.directory,
-        force: body.force || false,
+        name,
+        command: typeof body.command === "string" ? body.command : undefined,
+        directory:
+          typeof body.directory === "string" ? body.directory : undefined,
+        force: body.force === true,
         env,
         remoteName: "",
       }),
     );
 
-    // Record history
-    addHistoryEntry(body.name, "start");
-
+    addHistoryEntry(name, "start");
     return Response.json({ success: true });
-  } catch (e: any) {
-    return Response.json({ error: e.message }, { status: 500 });
+  } catch (error: any) {
+    return Response.json(
+      { error: error?.message || String(error) },
+      { status: 500 },
+    );
   }
 }

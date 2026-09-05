@@ -4,20 +4,16 @@ import {
   removeProcessByName,
   retryDatabaseOperation,
   insertProcess,
-  updateProcessPid,
 } from "../db";
 import {
   isProcessRunning,
+  isManagedProcessRunning,
   terminateProcess,
   getHomeDir,
   getShellCommand,
-  killProcessOnPort,
   findChildPid,
-  getProcessPorts,
-  waitForPortFree,
   psExec,
-  isPortFree,
-  reconcileProcessPids,
+  findManagedProcessPid,
   clearProcessRunningCache,
 } from "../platform";
 import { error, announce } from "../logger";
@@ -25,21 +21,18 @@ import {
   validateDirectory,
   parseEnvString,
   buildManagedProcessEnv,
-  getDeclaredPort,
   acquireProcessOperationLock,
   isInternalProcessName,
   stringifyEnvString,
 } from "../utils";
 import { parseConfigFile } from "../config";
-import { $ } from "bun";
 import { sleep } from "bun";
 import { existsSync, mkdirSync, readFileSync } from "fs";
 import { dirname, join } from "path";
-import { createMeasure } from "measure-fn";
+import { runMeasure as run, measureRequired } from "../observability";
 import { syncProcessWatcher } from "../watcher";
 
 const homePath = getHomeDir();
-const run = createMeasure("run");
 const INTERNAL_BUNX_PREFIX = "bunx bgrun";
 const STARTUP_HEALTH_GRACE_MS = Number(
   Bun.env.BGR_STARTUP_HEALTH_GRACE_MS || "1500",
@@ -129,6 +122,7 @@ async function resolveSpawnedProcessPid(
   parentPid: number,
   command: string,
   workdir: string,
+  processName: string,
 ): Promise<number> {
   if (parentPid <= 0) return 0;
 
@@ -150,14 +144,8 @@ async function resolveSpawnedProcessPid(
     await sleep(100);
   }
 
-  const reconciled = await reconcileProcessPids(
-    [{ name: "__spawn__", pid: parentPid, command, workdir }],
-    new Set([parentPid]),
-  );
-  const matchedPid = reconciled.get("__spawn__") ?? 0;
-  if (matchedPid > 0 && (await isProcessRunning(matchedPid, command))) {
-    return matchedPid;
-  }
+  const managedPid = await findManagedProcessPid(processName, command, workdir);
+  if (managedPid) return managedPid;
 
   if (process.platform === "win32") {
     try {
@@ -221,6 +209,40 @@ async function resolveSpawnedProcessPid(
   return 0;
 }
 
+async function runGit(directory: string, args: string[]): Promise<string> {
+  const proc = Bun.spawn(["git", ...args], {
+    cwd: directory,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdoutText, stderrText] = await Promise.all([
+    proc.exited,
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+
+  if (exitCode !== 0) {
+    throw new Error(stderrText.trim() || `git ${args.join(" ")} failed`);
+  }
+
+  return stdoutText.trim();
+}
+
+async function updateGitCheckout(directory: string): Promise<boolean> {
+  if (!existsSync(join(directory, ".git"))) {
+    throw new Error(`Cannot --fetch: '${directory}' is not a Git repository.`);
+  }
+
+  await runGit(directory, ["fetch", "origin"]);
+  const localHash = await runGit(directory, ["rev-parse", "HEAD"]);
+  const branch = await runGit(directory, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  const remoteHash = await runGit(directory, ["rev-parse", `origin/${branch}`]);
+
+  if (localHash === remoteHash) return false;
+  await runGit(directory, ["pull", "origin", branch]);
+  return true;
+}
+
 export function resolveInternalBgrunCommand(command: string): string {
   const trimmed = command.trim();
   if (
@@ -262,7 +284,8 @@ export async function handleRun(options: CommandOptions) {
       const { getUnmetDeps } = await import("../deps");
       const unmet = await getUnmetDeps(name);
       if (unmet.length > 0) {
-        await run.measure(
+        await measureRequired(
+          run.measure,
           `Start ${unmet.length} dependencies for "${name}"`,
           async () => {
             for (const depName of unmet) {
@@ -288,36 +311,19 @@ export async function handleRun(options: CommandOptions) {
     if (existingProcess) {
       const finalDirectory = directory || existingProcess.workdir;
       validateDirectory(finalDirectory);
-      $.cwd(finalDirectory);
 
       if (fetch) {
-        if (
-          !require("fs").existsSync(
-            require("path").join(finalDirectory, ".git"),
-          )
-        ) {
-          error(`Cannot --fetch: '${finalDirectory}' is not a Git repository.`);
-        }
-        await run.measure(`Git fetch "${name}"`, async () => {
-          try {
-            await $`git fetch origin`;
-            const localHash = (await $`git rev-parse HEAD`.text()).trim();
-            const remoteHash = (
-              await $`git rev-parse origin/$(git rev-parse --abbrev-ref HEAD)`.text()
-            ).trim();
-
-            if (localHash !== remoteHash) {
-              await $`git pull origin $(git rev-parse --abbrev-ref HEAD)`;
-              announce("📥 Pulled latest changes", "Git Update");
-            }
-          } catch (err) {
-            error(`Failed to pull latest changes: ${err}`);
-          }
-        });
+        const updated = await measureRequired(
+          run.measure,
+          `Git sync "${name}"`,
+          () => updateGitCheckout(finalDirectory),
+        );
+        if (updated) announce("📥 Pulled latest changes", "Git Update");
       }
 
-      const isRunning = await isProcessRunning(
+      const isRunning = await isManagedProcessRunning(
         existingProcess.pid,
+        name!,
         existingProcess.command,
       );
       if (isRunning && !force) {
@@ -326,153 +332,25 @@ export async function handleRun(options: CommandOptions) {
         );
       }
 
-      // PID Reconciliation: If stored PID is dead, try to find a matching live process
-      // This handles the case where cmd.exe wrapper died but bun.exe child is still running
-      // Skip reconciliation on --restart (force) to avoid attaching to wrong process
-      let actualPid = existingProcess.pid;
-      if (!isRunning && !force) {
-        const reconciled = await reconcileProcessPids(
-          [
-            {
-              name: name!,
-              pid: existingProcess.pid,
-              command: existingProcess.command,
-              workdir: existingProcess.workdir,
-            },
-          ],
-          new Set([existingProcess.pid]),
-        );
-        const newPid = reconciled.get(name!);
-        if (newPid) {
-          console.log(
-            `[run] Reconciled dead PID ${existingProcess.pid} to live PID ${newPid}`,
-          );
-          actualPid = newPid;
-          updateProcessPid(name!, newPid);
-        }
-      }
-
-      // Detect ports BEFORE killing so we can clean them up
-      // Use actualPid which may have been reconciled from a dead wrapper to a live child
-      let detectedPorts: number[] = [];
-      const actuallyRunning = await isProcessRunning(
-        actualPid,
-        existingProcess.command,
-      );
-      if (actuallyRunning) {
-        detectedPorts = await getProcessPorts(actualPid);
-      }
-
-      if (actuallyRunning) {
-        await run.measure(
-          `Terminate "${name}" (PID ${actualPid})`,
+      // Never search the machine for a "similar" process during restart.
+      // A stale row must remain stale rather than being attached to another app.
+      // Only the stored PID is eligible for termination, and only when its
+      // command still verifies as the process bgrun originally registered.
+      if (isRunning) {
+        await measureRequired(
+          run.measure,
+          `Terminate "${name}" (PID ${existingProcess.pid})`,
           async () => {
-            await terminateProcess(actualPid);
-            announce(
-              `🔥 Terminated existing process '${name}'`,
-              "Process Terminated",
-            );
+            await terminateProcess(existingProcess.pid, true);
           },
         );
       }
 
-      // Kill anything still on the ports the old process was using
-      if (detectedPorts.length > 0) {
-        await run.measure(
-          `Port cleanup [${detectedPorts.join(", ")}]`,
-          async () => {
-            for (const port of detectedPorts) {
-              await killProcessOnPort(port);
-            }
-            for (const port of detectedPorts) {
-              const freed = await waitForPortFree(port, 5000);
-              if (!freed) {
-                await killProcessOnPort(port);
-                await waitForPortFree(port, 3000);
-              }
-            }
-          },
-        );
-      }
-
-      // Also clean up the declared port if one exists.
-      // This is critical when the stored PID is dead (e.g., cmd.exe wrapper died)
-      // but the orphaned child (bun.exe) is still holding the port.
-      // getProcessPorts() returns [] for dead PIDs, so we need to check the declared port separately.
-      const existingEnv = existingProcess.env
-        ? parseEnvString(existingProcess.env)
-        : {};
-      const declaredPort = getDeclaredPort(
-        existingEnv,
-        existingProcess.command,
-      );
-      if (declaredPort && !detectedPorts.includes(declaredPort)) {
-        await run.measure(
-          `Declared port cleanup [${declaredPort}]`,
-          async () => {
-            const portFree = await isPortFree(declaredPort);
-            if (!portFree) {
-              console.log(
-                `[run] Declared port ${declaredPort} is busy (orphaned process), cleaning up...`,
-              );
-              await killProcessOnPort(declaredPort);
-              const freed = await waitForPortFree(declaredPort, 5000);
-              if (!freed) {
-                console.warn(
-                  `[run] Port ${declaredPort} still busy after cleanup, retrying...`,
-                );
-                await killProcessOnPort(declaredPort);
-                await waitForPortFree(declaredPort, 3000);
-              }
-            }
-          },
-        );
-      }
-
-      // Zombie sweep: kill any remaining bun processes matching this command
-      // This catches orphaned children that survived taskkill when the parent shell exited
-      // IMPORTANT: Exclude the current bgrun process and dashboard to avoid self-kill
-      const cmdToMatch = existingProcess.command;
-      if (cmdToMatch) {
-        await run.measure("Zombie sweep", async () => {
-          try {
-            const cmdKeyword = cmdToMatch.split(" ")[1] || cmdToMatch;
-            // Skip sweep if keyword is too generic (would match unrelated processes)
-            const GENERIC_KEYWORDS = [
-              "dev",
-              "run",
-              "start",
-              "serve",
-              "build",
-              "test",
-            ];
-            if (GENERIC_KEYWORDS.includes(cmdKeyword.toLowerCase())) {
-              return; // Too dangerous — skip zombie sweep for generic commands
-            }
-            const currentPid = process.pid;
-            // Use -like with wildcards instead of -match to avoid regex special chars breaking the query
-            const result = await psExec(
-              `Get-CimInstance Win32_Process -Filter "Name='bun.exe'" | Where-Object { $_.CommandLine -like '*${cmdKeyword.replace(/'/g, "''").replace(/([&[\](){}^$|\\*?+])/g, "$&")}*' -and $_.ProcessId -ne ${currentPid} } | Select-Object -ExpandProperty ProcessId`,
-              3000,
-            );
-            const zombiePids = result
-              .split("\n")
-              .map((l: string) => parseInt(l.trim()))
-              .filter((n: number) => !isNaN(n) && n > 0 && n !== currentPid);
-            for (const zPid of zombiePids) {
-              await $`taskkill /F /T /PID ${zPid}`.nothrow().quiet();
-            }
-            if (zombiePids.length > 0) {
-              announce(
-                `🧹 Swept ${zombiePids.length} zombie process(es)`,
-                "Zombie Cleanup",
-              );
-            }
-          } catch {
-            /* best effort */
-          }
-        });
-      }
+      // Do not kill by port here. Port ownership is not process ownership: a
+      // reverse proxy such as Caddy can have client connections to the same
+      // port, and a stale declared port may now belong to another service.
+      // If the port is still occupied, the new process will fail normally and
+      // surface a clear startup error without bgrun killing unrelated PIDs.
 
       await retryDatabaseOperation(() => removeProcessByName(name!));
     } else {
@@ -482,7 +360,6 @@ export async function handleRun(options: CommandOptions) {
         );
       }
       validateDirectory(directory!);
-      $.cwd(directory!);
     }
 
     const storedCommand = command || existingProcess!.command;
@@ -536,17 +413,20 @@ export async function handleRun(options: CommandOptions) {
       existingProcess?.stdout_path ||
       join(homePath, ".bgr", `${name}-out.txt`);
     mkdirSync(dirname(stdoutPath), { recursive: true });
-    Bun.write(stdoutPath, "");
     const stderrPath =
       stderr ||
       (logsDir ? join(logsDir, `${name}-err.txt`) : undefined) ||
       existingProcess?.stderr_path ||
       join(homePath, ".bgr", `${name}-err.txt`);
     mkdirSync(dirname(stderrPath), { recursive: true });
-    Bun.write(stderrPath, "");
+    await measureRequired(run.measure, `Prepare logs "${name}"`, () =>
+      Promise.all([Bun.write(stdoutPath, ""), Bun.write(stderrPath, "")]),
+    );
 
-    const actualPid =
-      (await run.measure(`Spawn "${name}" → ${finalCommand}`, async () => {
+    const actualPid = await measureRequired(
+      run.measure,
+      `Spawn "${name}" → ${finalCommand}`,
+      async () => {
         const newProcess = Bun.spawn(getShellCommand(finalCommand!), {
           env: buildManagedProcessEnv(
             Bun.env as Record<string, string | undefined>,
@@ -562,8 +442,10 @@ export async function handleRun(options: CommandOptions) {
           newProcess.pid,
           finalCommand!,
           finalDirectory,
+          name!,
         );
-      })) ?? 0;
+      },
+    );
 
     if (
       actualPid <= 0 ||
@@ -574,21 +456,25 @@ export async function handleRun(options: CommandOptions) {
       );
     }
 
-    await retryDatabaseOperation(() =>
-      insertProcess({
-        pid: actualPid,
-        workdir: finalDirectory,
-        command: finalCommand!,
-        name: name!,
-        env: stringifyEnvString(finalEnv),
-        configPath: finalConfigPath || "",
-        stdout_path: stdoutPath,
-        stderr_path: stderrPath,
-      }),
+    await measureRequired(run.measure, `Register "${name}"`, () =>
+      retryDatabaseOperation(() =>
+        insertProcess({
+          pid: actualPid,
+          workdir: finalDirectory,
+          command: finalCommand!,
+          name: name!,
+          env: stringifyEnvString(finalEnv),
+          configPath: finalConfigPath || "",
+          stdout_path: stdoutPath,
+          stderr_path: stderrPath,
+        }),
+      ),
     );
 
     if (!isInternalProcessName(name!)) {
-      await syncProcessWatcher(name!, finalEnv);
+      await measureRequired(run.measure, `Sync guard "${name}"`, () =>
+        syncProcessWatcher(name!, finalEnv),
+      );
     }
 
     announce(

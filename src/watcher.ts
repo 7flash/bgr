@@ -6,10 +6,12 @@ import {
   insertProcess,
   removeProcessByName,
   retryDatabaseOperation,
+  type Process,
 } from "./db";
 import {
   findChildPid,
   getHomeDir,
+  getProcessMemory,
   getShellCommand,
   isProcessRunning,
   psExec,
@@ -17,20 +19,38 @@ import {
 } from "./platform";
 import { handleRun } from "./commands/run";
 import { shellQuoteArg } from "./cli-helpers";
+import { measureRequired, watcherMeasure as watcher } from "./observability";
+import {
+  DEFAULT_GUARD_INTERVAL_MS,
+  GUARD_STABILITY_WINDOW_MS,
+  MEMORY_LIMIT_HITS_REQUIRED,
+  getGuardBackoffMs,
+  parseMemoryLimitMb,
+} from "./guard-policy";
 import {
   acquireProcessOperationLock,
-  getWatchedProcessName,
   getWatcherProcessName,
-  isProcessOperationLocked,
   isInternalProcessName,
+  isProcessOperationLocked,
   parseEnvString,
   stringifyEnvString,
 } from "./utils";
 
-const DEFAULT_INTERVAL_MS = 5_000;
-const CRASH_THRESHOLD = 5;
-const MAX_BACKOFF_MS = 5 * 60_000;
-const STABILITY_WINDOW_MS = 120_000;
+type RestartReason = "crash" | "memory";
+
+type WatcherState = {
+  restartCount: number;
+  nextRestartAt: number;
+  lastSeenAliveAt: number;
+  memoryLimitHits: number;
+};
+
+type GuardInspection = {
+  alive: boolean;
+  reason: RestartReason | null;
+  memoryBytes: number;
+  memoryLimitMb: number;
+};
 
 function getWatcherLogPaths(watcherName: string) {
   const homePath = getHomeDir();
@@ -51,7 +71,7 @@ async function findDetachedWatcherPid(
     4000,
   );
   const pid = parseInt(result.trim(), 10);
-  return !isNaN(pid) && pid > 0 ? pid : null;
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
 }
 
 function getInternalWatcherCommand(targetName: string): {
@@ -59,10 +79,59 @@ function getInternalWatcherCommand(targetName: string): {
   spawnCommand: string;
 } {
   const quotedTarget = shellQuoteArg(targetName);
-  return {
-    storedCommand: `bunx bgrun --_watch-process ${quotedTarget}`,
-    spawnCommand: `bunx bgrun --_watch-process ${quotedTarget}`,
-  };
+  const command = `bunx bgrun --_watch-process ${quotedTarget}`;
+  return { storedCommand: command, spawnCommand: command };
+}
+
+async function spawnWatcherProcess(
+  targetName: string,
+  watcherName: string,
+): Promise<number> {
+  const { stdoutPath, stderrPath } = getWatcherLogPaths(watcherName);
+  await Promise.all([Bun.write(stdoutPath, ""), Bun.write(stderrPath, "")]);
+
+  const { storedCommand, spawnCommand } = getInternalWatcherCommand(targetName);
+  const newProcess = Bun.spawn(getShellCommand(spawnCommand), {
+    env: {
+      ...Bun.env,
+      BGR_STDOUT: stdoutPath,
+      BGR_STDERR: stderrPath,
+    },
+    cwd: getHomeDir(),
+    stdout: "ignore",
+    stderr: "ignore",
+    detached: true,
+  } as any);
+
+  newProcess.unref();
+  await Bun.sleep(1_000);
+
+  let actualPid = await findChildPid(newProcess.pid);
+  if (!(await isProcessRunning(actualPid, storedCommand))) {
+    actualPid = (await findDetachedWatcherPid(targetName)) ?? 0;
+  }
+
+  if (actualPid <= 0 || !(await isProcessRunning(actualPid, storedCommand))) {
+    throw new Error(`Guard for "${targetName}" failed to stay running`);
+  }
+
+  await retryDatabaseOperation(() =>
+    insertProcess({
+      pid: actualPid,
+      workdir: getHomeDir(),
+      command: storedCommand,
+      name: watcherName,
+      env: stringifyEnvString({
+        BGR_KEEP_ALIVE: "false",
+        BGR_WATCH_TARGET: targetName,
+      }),
+      configPath: "",
+      stdout_path: stdoutPath,
+      stderr_path: stderrPath,
+    }),
+  );
+
+  return actualPid;
 }
 
 export async function ensureProcessWatcher(targetName: string): Promise<void> {
@@ -90,46 +159,8 @@ export async function ensureProcessWatcher(targetName: string): Promise<void> {
     await retryDatabaseOperation(() => removeProcessByName(watcherName));
   }
 
-  const { stdoutPath, stderrPath } = getWatcherLogPaths(watcherName);
-  await Bun.write(stdoutPath, "");
-  await Bun.write(stderrPath, "");
-
-  const { storedCommand, spawnCommand } = getInternalWatcherCommand(targetName);
-  const newProcess = Bun.spawn(getShellCommand(spawnCommand), {
-    env: {
-      ...Bun.env,
-      BGR_STDOUT: stdoutPath,
-      BGR_STDERR: stderrPath,
-    },
-    cwd: getHomeDir(),
-    stdout: "ignore",
-    stderr: "ignore",
-    detached: true,
-  } as any);
-
-  newProcess.unref();
-  await Bun.sleep(1000);
-
-  let actualPid = await findChildPid(newProcess.pid);
-  if (!(await isProcessRunning(actualPid, storedCommand))) {
-    const detachedPid = await findDetachedWatcherPid(targetName);
-    if (detachedPid) actualPid = detachedPid;
-  }
-
-  await retryDatabaseOperation(() =>
-    insertProcess({
-      pid: actualPid,
-      workdir: getHomeDir(),
-      command: storedCommand,
-      name: watcherName,
-      env: stringifyEnvString({
-        BGR_KEEP_ALIVE: "false",
-        BGR_WATCH_TARGET: targetName,
-      }),
-      configPath: "",
-      stdout_path: stdoutPath,
-      stderr_path: stderrPath,
-    }),
+  await measureRequired(watcher.measure, `Start guard "${targetName}"`, () =>
+    spawnWatcherProcess(targetName, watcherName),
   );
 }
 
@@ -139,7 +170,11 @@ export async function stopProcessWatcher(targetName: string): Promise<void> {
   if (!watcherProc) return;
 
   if (await isProcessRunning(watcherProc.pid, watcherProc.command)) {
-    await terminateProcess(watcherProc.pid, true);
+    await measureRequired(
+      watcher.measure,
+      `Stop guard "${targetName}" pid=${watcherProc.pid}`,
+      () => terminateProcess(watcherProc.pid, true),
+    );
   }
 
   await retryDatabaseOperation(() => removeProcessByName(watcherName));
@@ -158,99 +193,154 @@ export async function syncProcessWatcher(
   }
 }
 
-function getBackoffMs(restartCount: number): number {
-  if (restartCount <= CRASH_THRESHOLD) return 0;
-  const exponent = restartCount - CRASH_THRESHOLD;
-  return Math.min(30_000 * Math.pow(2, exponent - 1), MAX_BACKOFF_MS);
+function newWatcherState(): WatcherState {
+  return {
+    restartCount: 0,
+    nextRestartAt: 0,
+    lastSeenAliveAt: 0,
+    memoryLimitHits: 0,
+  };
 }
 
-async function cleanupWatcher(targetName: string) {
+function noteStableProcess(state: WatcherState, now: number): void {
+  if (state.restartCount <= 0) return;
+
+  if (!state.lastSeenAliveAt) {
+    state.lastSeenAliveAt = now;
+    return;
+  }
+
+  if (now - state.lastSeenAliveAt < GUARD_STABILITY_WINDOW_MS) return;
+
+  state.restartCount = 0;
+  state.nextRestartAt = 0;
+  state.lastSeenAliveAt = 0;
+}
+
+async function inspectTarget(
+  proc: Process,
+  env: Record<string, string>,
+  state: WatcherState,
+): Promise<GuardInspection> {
+  const alive = await isProcessRunning(proc.pid, proc.command);
+  if (!alive) {
+    state.memoryLimitHits = 0;
+    return { alive: false, reason: "crash", memoryBytes: 0, memoryLimitMb: 0 };
+  }
+
+  const memoryLimitMb = parseMemoryLimitMb(env);
+  const memoryRestartEnabled =
+    memoryLimitMb > 0 && env.BGR_MEMORY_RESTART !== "false";
+
+  if (!memoryRestartEnabled) {
+    state.memoryLimitHits = 0;
+    return { alive: true, reason: null, memoryBytes: 0, memoryLimitMb };
+  }
+
+  const memoryBytes = await getProcessMemory(proc.pid);
+  if (memoryBytes > memoryLimitMb * 1024 * 1024) {
+    state.memoryLimitHits++;
+  } else {
+    state.memoryLimitHits = 0;
+  }
+
+  return {
+    alive: true,
+    reason:
+      state.memoryLimitHits >= MEMORY_LIMIT_HITS_REQUIRED ? "memory" : null,
+    memoryBytes,
+    memoryLimitMb,
+  };
+}
+
+async function restartTarget(
+  targetName: string,
+  watcherName: string,
+  proc: Process,
+  inspection: GuardInspection,
+  state: WatcherState,
+): Promise<void> {
+  const now = Date.now();
+  if (now < state.nextRestartAt || !inspection.reason) return;
+
+  state.restartCount++;
+  const backoffMs = getGuardBackoffMs(state.restartCount);
+  state.nextRestartAt = backoffMs > 0 ? now + backoffMs : 0;
+
+  try {
+    await measureRequired(
+      watcher.measure,
+      `Restart target "${targetName}" reason=${inspection.reason} attempt=${state.restartCount}`,
+      () =>
+        handleRun({
+          action: "run",
+          name: targetName,
+          force: true,
+          remoteName: "",
+        }),
+    );
+
+    state.memoryLimitHits = 0;
+    state.lastSeenAliveAt = 0;
+    addHistoryEntry(targetName, "guard_restart", proc.pid, {
+      by: watcherName,
+      count: state.restartCount,
+      backoffMs,
+      reason: inspection.reason,
+      memoryBytes: inspection.memoryBytes || undefined,
+      memoryLimitMb: inspection.memoryLimitMb || undefined,
+    });
+  } catch (error: any) {
+    addHistoryEntry(targetName, "guard_restart_failed", proc.pid, {
+      by: watcherName,
+      count: state.restartCount,
+      backoffMs,
+      reason: inspection.reason,
+      error: error?.message || String(error),
+    });
+    console.error(
+      `[watcher] restart failed for "${targetName}": ${error?.message || error}`,
+    );
+  }
+}
+
+async function cleanupWatcher(targetName: string): Promise<void> {
   const watcherName = getWatcherProcessName(targetName);
   await retryDatabaseOperation(() => removeProcessByName(watcherName));
 }
 
 export async function startProcessWatcher(
   targetName: string,
-  intervalMs: number = DEFAULT_INTERVAL_MS,
-) {
+  intervalMs: number = DEFAULT_GUARD_INTERVAL_MS,
+): Promise<void> {
   const watcherName = getWatcherProcessName(targetName);
   const releaseWatcherLock = acquireProcessOperationLock(watcherName);
-  let restartCount = 0;
-  let nextRestartAt = 0;
-  let lastSeenAliveAt = 0;
+  const state = newWatcherState();
 
   try {
     console.log(
-      `[watcher] Watching "${targetName}" every ${Math.round(intervalMs / 1000)}s`,
+      `[watcher] watching "${targetName}" every ${Math.round(intervalMs / 1000)}s`,
     );
 
     while (true) {
       const proc = getProcess(targetName);
-      if (!proc) {
-        console.log(
-          `[watcher] Target "${targetName}" removed; exiting watcher`,
-        );
-        break;
-      }
+      if (!proc) break;
 
       const env = parseEnvString(proc.env || "");
-      if (env.BGR_KEEP_ALIVE !== "true") {
-        console.log(
-          `[watcher] Guard disabled for "${targetName}"; exiting watcher`,
-        );
-        break;
-      }
+      if (env.BGR_KEEP_ALIVE !== "true") break;
 
+      // PID 0 represents an intentional stop; an explicit user action must not
+      // be undone by the guard. Operation locks also suppress restart races.
       if (proc.pid <= 0 || isProcessOperationLocked(targetName)) {
         await Bun.sleep(intervalMs);
         continue;
       }
 
-      const alive = await isProcessRunning(proc.pid, proc.command);
-      if (!alive) {
-        const now = Date.now();
-        if (now < nextRestartAt) {
-          await Bun.sleep(intervalMs);
-          continue;
-        }
-
-        try {
-          console.log(
-            `[watcher] Restarting "${targetName}" after detected crash`,
-          );
-          await handleRun({
-            action: "run",
-            name: targetName,
-            force: true,
-            remoteName: "",
-          });
-          restartCount++;
-          const backoffMs = getBackoffMs(restartCount);
-          nextRestartAt = backoffMs > 0 ? now + backoffMs : 0;
-          lastSeenAliveAt = 0;
-          addHistoryEntry(targetName, "guard_restart", proc.pid, {
-            by: watcherName,
-            count: restartCount,
-            backoffMs,
-          });
-        } catch (err: any) {
-          addHistoryEntry(targetName, "guard_restart_failed", proc.pid, {
-            by: watcherName,
-            error: err?.message || String(err),
-          });
-          console.error(
-            `[watcher] Failed to restart "${targetName}": ${err.message}`,
-          );
-        }
-      } else if (restartCount > 0) {
-        const now = Date.now();
-        if (!lastSeenAliveAt) {
-          lastSeenAliveAt = now;
-        } else if (now - lastSeenAliveAt >= STABILITY_WINDOW_MS) {
-          restartCount = 0;
-          nextRestartAt = 0;
-          lastSeenAliveAt = 0;
-        }
+      const inspection = await inspectTarget(proc, env, state);
+      if (inspection.reason) {
+        await restartTarget(targetName, watcherName, proc, inspection, state);
+      } else if (inspection.alive) {
+        noteStableProcess(state, Date.now());
       }
 
       await Bun.sleep(intervalMs);
@@ -282,10 +372,23 @@ export function getRecentGuardEvents(limit = 100) {
     )
     .slice(0, limit);
 
-  return rows.map((row: any) => ({
-    time: new Date(row.timestamp).getTime(),
-    name: row.process_name,
-    action: "restart",
-    success: row.event === "guard_restart",
-  }));
+  return rows.map((row: any) => {
+    let metadata: Record<string, any> = {};
+    try {
+      metadata = row.metadata ? JSON.parse(row.metadata) : {};
+    } catch {
+      metadata = {};
+    }
+
+    return {
+      time: new Date(row.timestamp).getTime(),
+      name: row.process_name,
+      action: "restart",
+      success: row.event === "guard_restart",
+      reason: metadata.reason,
+      memoryBytes: metadata.memoryBytes,
+      memoryLimitMb: metadata.memoryLimitMb,
+      backoffMs: metadata.backoffMs,
+    };
+  });
 }

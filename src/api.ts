@@ -38,6 +38,8 @@ export {
 // --- Process Operations ---
 export {
   isProcessRunning,
+  isManagedProcessRunning,
+  findManagedProcessPid,
   terminateProcess,
   readFileTail,
   getProcessPorts,
@@ -118,6 +120,8 @@ import {
 } from "./db";
 import {
   isProcessRunning,
+  isManagedProcessRunning,
+  findManagedProcessPid,
   terminateProcess,
   readFileTail,
   getProcessPorts,
@@ -191,6 +195,8 @@ export default {
   dbPath,
   bgrHome,
   isProcessRunning,
+  isManagedProcessRunning,
+  findManagedProcessPid,
   terminateProcess,
   readFileTail,
   getProcessPorts,

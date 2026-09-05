@@ -1,17 +1,7 @@
-import boxen from "boxen";
 import chalk from "chalk";
 
-export function announce(message: string, title?: string) {
-  console.log(
-    boxen(message, {
-      padding: 1,
-      margin: 1,
-      borderColor: "green",
-      title: title || "bgrun",
-      titleAlignment: "center",
-      borderStyle: "round",
-    }),
-  );
+export function announce(message: string, _title?: string) {
+  console.log(message);
 }
 
 /** Custom error class so callers can distinguish bgrun errors from unexpected ones */
@@ -27,17 +17,6 @@ export function error(message: string | Error): never {
     message instanceof Error
       ? message.stack || message.message
       : String(message);
-  console.error(
-    boxen(chalk.red(text), {
-      padding: 1,
-      margin: 1,
-      borderColor: "red",
-      title: "Error",
-      titleAlignment: "center",
-      borderStyle: "double",
-    }),
-  );
-  // Throw instead of process.exit() — lets dashboard API handlers catch gracefully
-  // CLI entry point has a top-level catch that calls process.exit(1)
+  console.error(chalk.red(`error: ${text}`));
   throw new BgrunError(text);
 }

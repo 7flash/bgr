@@ -1,19 +1,11 @@
-import chalk from "chalk";
-import { renderProcessTable } from "../table";
-import type { ProcessTableRow } from "../table";
-import { getAllProcesses, updateProcessPid } from "../db";
-import { announce } from "../logger";
+import { getAllProcesses } from "../db";
 import {
   isProcessRunning,
   calculateRuntime,
   parseEnvString,
   isInternalProcessName,
 } from "../utils";
-import {
-  getProcessBatchResources,
-  reconcileProcessPids,
-  resolvePidWithPorts,
-} from "../platform";
+import { getProcessBatchResources, resolvePidWithPorts } from "../platform";
 
 type ShowAllOptions = {
   json?: boolean;
@@ -105,41 +97,13 @@ export async function showAll(opts?: ShowAllOptions) {
     return;
   }
 
-  // ─── PID Reconciliation ──────────────────────────────────────────
-  // On Windows, the stored PID may be a dead cmd.exe wrapper while the
-  // actual bun.exe child is still running. Detect dead PIDs up-front,
-  // reconcile them in one batch PowerShell call, and patch the DB so
-  // subsequent invocations are stable (no flicker).
-  const deadPids = new Set<number>();
+  // Status is read-only. Never reconcile a stale PID by scanning unrelated
+  // processes; a stale row should display as stopped instead of being silently
+  // attached to another live service.
   const aliveCache = new Map<number, boolean>();
-
   for (const proc of filtered) {
-    const alive = await isProcessRunning(proc.pid, proc.command);
-    aliveCache.set(proc.pid, alive);
-    if (!alive && proc.pid > 0) deadPids.add(proc.pid);
+    aliveCache.set(proc.pid, await isProcessRunning(proc.pid, proc.command));
   }
-
-  if (deadPids.size > 0) {
-    const reconciled = await reconcileProcessPids(
-      filtered.map((p) => ({
-        name: p.name,
-        pid: p.pid,
-        command: p.command,
-        workdir: p.workdir,
-      })),
-      deadPids,
-    );
-
-    for (const [name, newPid] of reconciled) {
-      updateProcessPid(name, newPid);
-      const proc = filtered.find((p) => p.name === name);
-      if (proc) {
-        (proc as any).pid = newPid;
-        aliveCache.set(newPid, true);
-      }
-    }
-  }
-  // ─────────────────────────────────────────────────────────────────
 
   if (opts?.json) {
     const jsonData: any[] = [];
@@ -156,10 +120,6 @@ export async function showAll(opts?: ShowAllOptions) {
         const resolved = await resolvePidWithPorts(proc.pid);
         displayPid = resolved.pid;
         ports = resolved.ports;
-        if (displayPid !== proc.pid) {
-          updateProcessPid(proc.name, displayPid);
-          (proc as any).pid = displayPid;
-        }
       }
 
       jsonData.push({
@@ -185,9 +145,9 @@ export async function showAll(opts?: ShowAllOptions) {
     return;
   }
 
-  const tableData: ProcessTableRow[] = [];
   const allPids = filtered.map((p) => p.pid);
   const resourceMap = await getProcessBatchResources(allPids);
+  const lines: string[] = [];
 
   for (const proc of filtered) {
     const isRunning =
@@ -195,66 +155,18 @@ export async function showAll(opts?: ShowAllOptions) {
       (await isProcessRunning(proc.pid, proc.command));
     const runtime = calculateRuntime(proc.timestamp);
 
-    let displayPid = proc.pid;
-    let ports: number[] = [];
-    if (isRunning) {
-      const resolved = await resolvePidWithPorts(proc.pid);
-      displayPid = resolved.pid;
-      ports = resolved.ports;
-      if (displayPid !== proc.pid) {
-        updateProcessPid(proc.name, displayPid);
-        (proc as any).pid = displayPid;
-      }
-    }
-
-    const mem = isRunning
-      ? resourceMap.get(displayPid)?.memory ||
-        resourceMap.get(proc.pid)?.memory ||
-        0
-      : 0;
-    tableData.push({
-      id: proc.id,
-      pid: displayPid,
-      name: proc.name,
-      port: ports.length > 0 ? ports.map((p) => `:${p}`).join(",") : "-",
-      memory: formatMemory(mem),
-      command: proc.command,
-      workdir: proc.workdir,
-      status: isRunning
-        ? chalk.green.bold("● Running")
-        : chalk.red.bold("○ Stopped"),
-      runtime: runtime,
-    });
+    const displayPid = proc.pid;
+    const mem = isRunning ? resourceMap.get(proc.pid)?.memory || 0 : 0;
+    const status = isRunning ? "running" : "stopped";
+    const pidText = isRunning ? `pid=${displayPid}` : "pid=-";
+    const memText = isRunning ? formatMemory(mem) : "-";
+    lines.push(`${proc.name}  ${status}  ${pidText}  ${memText}  ${runtime}`);
   }
 
-  if (tableData.length === 0) {
-    if (opts?.filter) {
-      announce(
-        `No processes matched filter BGR_GROUP='${opts.filter}'.`,
-        "No Matches",
-      );
-    } else {
-      announce("No processes found.", "Empty");
-    }
+  if (lines.length === 0) {
+    console.log(opts?.filter ? "no matching processes" : "no processes");
     return;
   }
 
-  const tableOutput = renderProcessTable(tableData, {
-    padding: 1,
-    borderStyle: "rounded",
-    showHeaders: true,
-  });
-  console.log(tableOutput);
-
-  const runningCount = tableData.filter((p) =>
-    p.status.includes("Running"),
-  ).length;
-  const stoppedCount = tableData.filter((p) =>
-    p.status.includes("Stopped"),
-  ).length;
-  console.log(
-    chalk.cyan(
-      `Total: ${tableData.length} processes (${chalk.green(`${runningCount} running`)}, ${chalk.red(`${stoppedCount} stopped`)})`,
-    ),
-  );
+  console.log(lines.join("\n"));
 }

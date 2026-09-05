@@ -605,13 +605,8 @@ async function run() {
 
     // Kill existing if force
     if (existing) {
-      if (await isProcessRunning(existing.pid)) {
-        const detectedPorts = await getProcessPorts(existing.pid);
+      if (await isProcessRunning(existing.pid, existing.command)) {
         await terminateProcess(existing.pid);
-        for (const p of detectedPorts) {
-          await killProcessOnPort(p);
-          await waitForPortFree(p, 5000);
-        }
       }
       await retryDatabaseOperation(() => removeProcessByName(dashboardName));
     }
@@ -639,23 +634,13 @@ async function run() {
     spawnEnv.BGR_STDERR = stderrPath;
 
     if (explicitPort && explicitPort > 0) {
-      // Only reclaim a dashboard port when the user explicitly asked for one.
+      // Never kill an unknown listener just because the requested dashboard port
+      // is occupied. Let the server choose/fail cleanly instead.
       const portFree = await isPortFree(explicitPort);
       if (!portFree) {
         console.log(
-          chalk.yellow(
-            `  ⚡ Requested dashboard port ${explicitPort} is occupied — reclaiming...`,
-          ),
+          `dashboard port ${explicitPort} is busy; leaving its owner untouched`,
         );
-        await killProcessOnPort(explicitPort);
-        const freed = await waitForPortFree(explicitPort, 5000);
-        if (!freed) {
-          console.log(
-            chalk.red(
-              `  ⚠ Could not free port ${explicitPort} — dashboard may pick a fallback port`,
-            ),
-          );
-        }
       }
     }
 
